@@ -1,0 +1,25 @@
+name: Build ESP32-S3 firmware
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install core and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.17
+          arduino-cli lib install "OneWire" "DallasTemperature"
+      - name: Compile
+        run: |
+          mkdir -p sketch/kettler_temp
+          cp kettler_temp.ino MotorHealth.h sketch/kettler_temp/
+          arduino-cli compile --fqbn esp32:esp32:esp32s3 --output-dir out sketch/kettler_temp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: out/*.merged.bin
