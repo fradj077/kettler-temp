@@ -25,6 +25,10 @@
 
 #define U16(x) NimBLEUUID((uint16_t)(x))
 
+// الأنواع هنا في الأعلى: مترجم Arduino يولّد تعريفات الدوال تلقائيًا قبل أول دالة
+struct Fwd { uint8_t n; uint8_t d[10]; uint32_t ms; };
+struct LockState { uint32_t last; bool stopped; float lastTarget; };
+
 OneWire ow(PIN_DS);
 DallasTemperature ds(&ow);
 NimBLEServer* gServer = nullptr;
@@ -248,7 +252,6 @@ void cpReplyPush(uint8_t op, uint8_t res) {
   __sync_synchronize();
   cpRH = nx;
 }
-struct Fwd { uint8_t n; uint8_t d[10]; uint32_t ms; };
 Fwd fwdQ[16];
 volatile uint8_t fwdH = 0, fwdT = 0;
 void fwdPush(const uint8_t* d, size_t n) {
@@ -332,13 +335,12 @@ class ScanCb : public NimBLEAdvertisedDeviceCallbacks {
 };
 ScanCb scanCb;
 
-template <size_t N>
-bool readInto(NimBLERemoteService* s, uint16_t uuid, uint8_t (&dst)[N]) {
+bool readInto(NimBLERemoteService* s, uint16_t uuid, uint8_t* dst, size_t n) {
   NimBLERemoteCharacteristic* c = s->getCharacteristic(U16(uuid));
   if (!c || !c->canRead()) return false;
   auto v = c->readValue();
-  if (v.size() < N) return false;
-  memcpy(dst, (const uint8_t*)v.data(), N);
+  if (v.size() < n) return false;
+  memcpy(dst, (const uint8_t*)v.data(), n);
   return true;
 }
 
@@ -366,7 +368,7 @@ bool tmConnect() {
   if (c && c->canNotify()) c->subscribe(true, tmStatusNotify);
   if (!fmGot) {                                           // مواصفات المشاية مرة واحدة
     uint8_t f[8], sp[6], ic[6];
-    bool a = readInto(s, 0x2ACC, f), b = readInto(s, 0x2AD4, sp), d = readInto(s, 0x2AD5, ic);
+    bool a = readInto(s, 0x2ACC, f, 8), b = readInto(s, 0x2AD4, sp, 6), d = readInto(s, 0x2AD5, ic, 6);
     if (a) memcpy(fmFeatB, f, 8);
     if (b) memcpy(fmSpdB, sp, 6);
     if (d) memcpy(fmIncB, ic, 6);
@@ -397,7 +399,6 @@ void flushFwd() {
 }
 
 // قرار الحماية: تخفيض السرعة 1 كم/س كل 1.5 ثانية حتى 3 كم/س ثم إيقاف، وإيقاف فوري عند الخطر الشديد
-struct LockState { uint32_t last; bool stopped; float lastTarget; };
 size_t lockDecide(LockState& s, uint32_t now, bool fresh, float cur, bool hard, uint8_t out[3]) {
   uint32_t gap = s.stopped ? 3000 : 1500;
   if ((uint32_t)(now - s.last) < gap) return 0;
