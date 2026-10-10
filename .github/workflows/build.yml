@@ -6,6 +6,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: arduino/setup-arduino-cli@v2
       - name: Install core and libraries
         run: |
@@ -17,14 +19,14 @@ jobs:
       - name: Compile
         run: |
           mkdir -p sketch/kettler_temp
-          cp kettler_temp.ino MotorHealth.h sketch/kettler_temp/
+          F=$(git log -1 --name-only --diff-filter=AM --format= -- '*.ino' | head -1)
+          echo "Using sketch: $F"
+          cp "$F" sketch/kettler_temp/kettler_temp.ino
+          cp MotorHealth.h sketch/kettler_temp/
           arduino-cli compile --fqbn esp32:esp32:esp32s3 --output-dir out sketch/kettler_temp
-      - name: Merge into one file
+      - name: Collect firmware
         run: |
-          pip install esptool
           mkdir -p merged
-          BA=$(find ~/.arduino15 -name boot_app0.bin | head -1)
-          python3 -m esptool --chip esp32s3 merge_bin -o merged/kettler_temp_merged.bin 0x0 out/kettler_temp.ino.bootloader.bin 0x8000 out/kettler_temp.ino.partitions.bin 0xe000 "$BA" 0x10000 out/kettler_temp.ino.bin
           cp out/kettler_temp.ino.bin merged/kettler_temp_app.bin
       - uses: actions/upload-artifact@v4
         with:
