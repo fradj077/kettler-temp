@@ -48,6 +48,7 @@ volatile float pendW = 0, pendH = 0;
 volatile bool lockOn = false;        // حماية الحرارة فعّالة
 volatile bool hardStop = false;      // الحرارة فوق الخطر بفارق كبير: إيقاف فوري
 volatile bool manualLink = false;    // زر "ربط المشاية" في التطبيق
+volatile uint32_t dOffAt = 0;        // لحظة ضغط "فصل": تُلغي أسباب الاتصال الضعيفة بعدها
 volatile float lastTemp = -100.0f;
 uint8_t hotCnt = 0;
 float effWarn() { return warnC < hotC ? warnC : hotC - 5.0f; }
@@ -70,8 +71,8 @@ void handleLine(const char* l) {
   if (l[0] == 'M') { mhe.pushCommand(l); return; }
   if (l[0] == 'W') { float v = atof(l + 1); if (v >= 20 && v <= 120) pendW = v; return; }
   if (l[0] == 'H') { float v = atof(l + 1); if (v >= 20 && v <= 120) pendH = v; return; }
-  if (l[0] == 'C') { manualLink = true; return; }
-  if (l[0] == 'D') { manualLink = false; return; }
+  if (l[0] == 'C') { manualLink = true; dOffAt = 0; return; }
+  if (l[0] == 'D') { manualLink = false; dOffAt = millis() | 1; return; }
 }
 void feedByte(char c) {
   if (c == '\n' || c == '\r') {
@@ -416,6 +417,18 @@ size_t lockDecide(LockState& s, uint32_t now, bool fresh, float cur, bool hard, 
   return 3;
 }
 
+// متى يجب أن تكون اللوحة متصلة بالمشاية؟
+// الحماية وزر "ربط المشاية" يعملان دائمًا. أما الأسباب الأخرى فتسقط بعد "فصل":
+// تطبيق (Kinomap/Zwift) نشط خلال آخر 30 ثانية وبعد الفصل فقط، أو حرارة قريبة من التحذير بعد دقيقة من الفصل.
+bool wantLink(uint32_t now, bool lock, bool manual, uint32_t ftmsAct, uint32_t dOff, float temp, float warn) {
+  if (lock || manual) return true;
+  bool fresh = ftmsAct && (uint32_t)(now - ftmsAct) < 30000UL;
+  if (fresh && dOff && (int32_t)(ftmsAct - dOff) <= 0) fresh = false;
+  bool weakOk = !dOff || (uint32_t)(now - dOff) > 60000UL;
+  bool standby = weakOk && temp > -50.0f && temp >= warn - 2.0f;
+  return fresh || standby;
+}
+
 void guardTask(void*) {
   LockState ls = {0, false, 0};
   uint32_t linkAt = 0;
@@ -608,11 +621,7 @@ void loop() {
     if (gServer->getConnectedCount() == 0) { connected = false; ftmsLastAct = 0; }
   }
 
-  // متى تتصل اللوحة بالمشاية؟ حماية، أو زر الربط، أو تطبيق متصل بالوسيط، أو حرارة قريبة من التحذير، أو الحزام يتحرك
-  bool ftmsRecent = ftmsLastAct && (uint32_t)(now - ftmsLastAct) < 60000UL;
-  bool standby = lastTemp > -50.0f && lastTemp >= warnC - 2.0f;
-  bool moving = tmLinked && (uint32_t)(now - tmSpeedMs) < 4000 && tmSpeed > 0.1f;
-  guardWant = lockOn || manualLink || ftmsRecent || standby || moving;
+  guardWant = wantLink(now, lockOn, manualLink, ftmsLastAct, dOffAt, lastTemp, warnC);
 
   if (connected && now - connMs > 1500) {
     if (needStatus || lastSentState != guardState || lastSentLock != (lockOn ? 1 : 0)) {
