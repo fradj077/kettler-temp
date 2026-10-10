@@ -418,12 +418,16 @@ size_t lockDecide(LockState& s, uint32_t now, bool fresh, float cur, bool hard, 
 }
 
 // متى يجب أن تكون اللوحة متصلة بالمشاية؟
-// الحماية وزر "ربط المشاية" يعملان دائمًا. أما الأسباب الأخرى فتسقط بعد "فصل":
-// تطبيق (Kinomap/Zwift) نشط خلال آخر 30 ثانية وبعد الفصل فقط، أو حرارة قريبة من التحذير بعد دقيقة من الفصل.
-bool wantLink(uint32_t now, bool lock, bool manual, uint32_t ftmsAct, uint32_t dOff, float temp, float warn) {
-  if (lock || manual) return true;
-  bool fresh = ftmsAct && (uint32_t)(now - ftmsAct) < 30000UL;
+// الحماية تعمل دائمًا. زر "ربط المشاية" يعمل ما دام تطبيق ما متصلًا باللوحة (يسقط بعد 20 ثانية من غياب كل التطبيقات).
+// تطبيق مثل Kinomap/Zwift يُبقي الاتصال ما دام أرسل أمرًا خلال آخر 20 ثانية وبعد آخر ضغط على "فصل".
+// وتستعد اللوحة أيضًا عندما تقترب الحرارة من حد التحذير (بعد دقيقة من الفصل).
+#define IDLE_MS 20000UL
+bool wantLink(uint32_t now, bool lock, bool manual, uint32_t ftmsAct, uint32_t dOff, float temp, float warn, bool gone) {
+  if (lock) return true;
+  if (manual && !gone) return true;
+  bool fresh = ftmsAct && (uint32_t)(now - ftmsAct) < IDLE_MS;
   if (fresh && dOff && (int32_t)(ftmsAct - dOff) <= 0) fresh = false;
+  if (gone) fresh = false;
   bool weakOk = !dOff || (uint32_t)(now - dOff) > 60000UL;
   bool standby = weakOk && temp > -50.0f && temp >= warn - 2.0f;
   return fresh || standby;
@@ -478,10 +482,16 @@ void bridgePump(uint32_t now) {
     fmData->notify();
     if ((uint32_t)(now - tmSpeedMs) < 4000) mhe.feedSpeed(now, tmSpeed, tmIncl);
   } else if (!tmLinked && ftmsLastAct && (uint32_t)(now - ftmsLastAct) < 60000) {
-    static uint32_t lastZero = 0;                     // قبل اكتمال الاتصال: سرعة صفر
+    static uint32_t lastZero = 0;                     // قبل اكتمال الاتصال: آخر قراءة معروفة (أو صفر)
     if ((uint32_t)(now - lastZero) >= 1000) {
       static const uint8_t z[4] = {0, 0, 0, 0};
-      fmData->setValue(z, 4);
+      if (tmPktLen > 0 && (uint32_t)(now - tmSpeedMs) < 60000UL) {
+        uint8_t b[32]; uint8_t n = tmPktLen;
+        memcpy(b, (const void*)tmPkt, n);
+        fmData->setValue(b, n);
+      } else {
+        fmData->setValue(z, 4);
+      }
       fmData->notify();
       lastZero = now;
     }
@@ -618,10 +628,13 @@ void loop() {
   static uint32_t lastChk = 0;
   if ((uint32_t)(now - lastChk) >= 1000) {            // لا أحد متصل: صفّر الحالات
     lastChk = now;
-    if (gServer->getConnectedCount() == 0) { connected = false; ftmsLastAct = 0; }
+    if (gServer->getConnectedCount() == 0) connected = false;
   }
 
-  guardWant = wantLink(now, lockOn, manualLink, ftmsLastAct, dOffAt, lastTemp, warnC);
+  static uint32_t lastClientMs = 0;
+  if (gServer->getConnectedCount() > 0) lastClientMs = now;
+  bool gone = (uint32_t)(now - lastClientMs) > IDLE_MS;
+  guardWant = wantLink(now, lockOn, manualLink, ftmsLastAct, dOffAt, lastTemp, warnC, gone);
 
   if (connected && now - connMs > 1500) {
     if (needStatus || lastSentState != guardState || lastSentLock != (lockOn ? 1 : 0)) {
