@@ -28,7 +28,6 @@ jobs:
         run: |
           mkdir -p merged
           cp out/kettler_temp.ino.bin merged/kettler_temp_app.bin
-          cp out/kettler_temp.ino.merged.bin merged/kettler_temp_full.bin
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
