@@ -123,7 +123,10 @@ class TxCb : public NimBLECharacteristicCallbacks {
 };
 class SrvCb : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s) { if (s->getConnectedCount() < 2) NimBLEDevice::startAdvertising(); }
-  void onDisconnect(NimBLEServer*) { NimBLEDevice::startAdvertising(); }
+  void onDisconnect(NimBLEServer*) {
+    if (txChar) connected = (txChar->getSubscribedCount() > 0);
+    NimBLEDevice::startAdvertising();
+  }
 };
 
 // ---------- تحديث البرنامج بالبلوتوث (OTA) ----------
@@ -317,10 +320,11 @@ volatile bool tmLinked = false;
 volatile bool needCtrl = true;
 NimBLEClient* tmClient = nullptr;
 NimBLERemoteCharacteristic* tmCp = nullptr;
-NimBLEAddress* tmAddr = nullptr;
+NimBLEAddress tmAddr;
 volatile bool tmFound = false;
 static const uint8_t CMD_REQ[] = {0x00};          // Request Control
 
+static portMUX_TYPE pktMux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t tmPkt[32]; volatile uint8_t tmPktLen = 0; volatile bool tmPktNew = false;
 uint8_t tmSt[16];  volatile uint8_t tmStLen = 0;  volatile bool tmStNew = false;
 volatile float tmSpeed = 0, tmIncl = 0;
@@ -328,7 +332,9 @@ volatile uint32_t tmSpeedMs = 0;
 
 void tmDataNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   if (n < 2 || n > sizeof tmPkt) return;
+  portENTER_CRITICAL(&pktMux);
   memcpy(tmPkt, d, n); tmPktLen = (uint8_t)n; tmPktNew = true;
+  portEXIT_CRITICAL(&pktMux);
   uint16_t f = d[0] | (d[1] << 8);
   size_t o = 2;
   if (!(f & 1)) { if (n >= o + 2) { tmSpeed = (d[o] | (d[o + 1] << 8)) * 0.01f; tmSpeedMs = millis(); } o += 2; }
@@ -338,7 +344,9 @@ void tmDataNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
 }
 void tmStatusNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   if (n < 1 || n > sizeof tmSt) return;
+  portENTER_CRITICAL(&pktMux);
   memcpy(tmSt, d, n); tmStLen = (uint8_t)n; tmStNew = true;
+  portEXIT_CRITICAL(&pktMux);
 }
 void cpNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   if (n >= 3 && d[0] == 0x80 && d[2] == 0x05) needCtrl = true;   // 5 = لا صلاحية تحكم
@@ -353,8 +361,7 @@ class ScanCb : public NimBLEAdvertisedDeviceCallbacks {
       if (nm.find("KETTLER") != std::string::npos && nm.find("TEMP") == std::string::npos) ok = true;
     }
     if (ok) {
-      delete tmAddr;
-      tmAddr = new NimBLEAddress(d->getAddress());
+      tmAddr = d->getAddress();
       tmFound = true;
       NimBLEDevice::getScan()->stop();
     }
@@ -381,9 +388,9 @@ bool tmConnect() {
   sc->setWindow(80);
   sc->start(6, false);
   sc->clearResults();
-  if (!tmFound || !tmAddr) return false;
+  if (!tmFound) return false;
   if (!tmClient) { tmClient = NimBLEDevice::createClient(); tmClient->setConnectTimeout(8); }
-  if (!tmClient->connect(*tmAddr)) return false;
+  if (!tmClient->connect(tmAddr)) return false;
   NimBLERemoteService* s = tmClient->getService(U16(0x1826));
   if (!s) { tmClient->disconnect(); return false; }
   tmCp = s->getCharacteristic(U16(0x2AD9));
@@ -406,8 +413,9 @@ bool tmConnect() {
 }
 
 void ensureCtrl() {
-  if (needCtrl) {
-    tmCp->writeValue(CMD_REQ, 1, false);
+  if (needCtrl && tmCp) {
+    bool resp = tmCp->canWrite();
+    tmCp->writeValue(CMD_REQ, 1, resp);
     needCtrl = false;
     vTaskDelay(pdMS_TO_TICKS(300));
   }
@@ -454,8 +462,10 @@ bool cdActive = false;
 uint32_t cdEnd = 0;
 bool speedFresh() { return (uint32_t)(millis() - tmSpeedMs) < 4000; }
 void sendRaw(const uint8_t* d, size_t n) {
+  if (!tmCp) return;
   ensureCtrl();
-  tmCp->writeValue(d, n, false);
+  bool resp = tmCp->canWrite();
+  tmCp->writeValue(d, n, resp);
   vTaskDelay(pdMS_TO_TICKS(40));
 }
 void shaperReset() { reqSpeed = -1.0f; outSpeed = -1.0f; lastSentSpd = -1.0f; cdActive = false; }
@@ -511,6 +521,7 @@ void flushFwd() {
 void shaperTick(uint32_t now) {
   static uint32_t last = 0;
   if ((uint32_t)(now - last) < 500) return;
+  float dt = (last == 0) ? 0.5f : (now - last) / 1000.0f;
   last = now;
   if (cdActive && (int32_t)(now - cdEnd) >= 0) {      // انتهى المشي البطيء: أوقف
     shaperReset();
@@ -522,7 +533,7 @@ void shaperTick(uint32_t now) {
   if (outSpeed < 0) outSpeed = speedFresh() ? tmSpeed : reqSpeed;
   float cap = capSpeedFor(lastTemp, effWarn(), hotC, effMaxSpeed(), cfg.capMin, cfg.capOn != 0);
   float target = reqSpeed < cap ? reqSpeed : cap;
-  outSpeed = shapeStep(outSpeed, target, cfg.accel, cfg.decel, 0.5f);
+  outSpeed = shapeStep(outSpeed, target, cfg.accel, cfg.decel, dt);
   if (lastSentSpd < 0 || fabsf(outSpeed - lastSentSpd) >= 0.05f) {
     uint16_t v = (uint16_t)lroundf(outSpeed * 100.0f);
     uint8_t b[3] = {0x02, (uint8_t)(v & 255), (uint8_t)(v >> 8)};
@@ -587,7 +598,7 @@ void guardTask(void*) {
         if (fresh || (uint32_t)(now - linkAt) >= 2500) {
           uint8_t cmd[3];
           size_t n = lockDecide(ls, now, fresh, tmSpeed, hardStop, cmd);
-          if (n) { ensureCtrl(); tmCp->writeValue(cmd, n, false); }
+          if (n && tmCp) { ensureCtrl(); bool resp = tmCp->canWrite(); tmCp->writeValue(cmd, n, resp); }
         }
         fwdT = fwdH;                                  // أوامر التطبيقات مرفوضة أثناء الحماية
         shaperReset();
@@ -613,11 +624,17 @@ void bridgePump(uint32_t now) {
     fmCp->indicate();
     cpRT = (cpRT + 1) & 3;
   }
-  if (tmPktNew) {                                     // بيانات المشاية إلى التطبيقات
+  uint8_t bPkt[32]; uint8_t nPkt = 0;
+  portENTER_CRITICAL(&pktMux);
+  if (tmPktNew) {
     tmPktNew = false;
-    uint8_t b[32]; uint8_t n = tmPktLen;
-    memcpy(b, (const void*)tmPkt, n);
-    fmData->setValue(b, n);
+    nPkt = tmPktLen;
+    memcpy(bPkt, (const void*)tmPkt, nPkt);
+  }
+  portEXIT_CRITICAL(&pktMux);
+
+  if (nPkt > 0) {                                     // بيانات المشاية إلى التطبيقات
+    fmData->setValue(bPkt, nPkt);
     fmData->notify();
     if ((uint32_t)(now - tmSpeedMs) < 4000) mhe.feedSpeed(now, tmSpeed, tmIncl);
   } else if (!tmLinked && ftmsLastAct && (uint32_t)(now - ftmsLastAct) < 60000) {
@@ -635,11 +652,16 @@ void bridgePump(uint32_t now) {
       lastZero = now;
     }
   }
+  uint8_t bSt[16]; uint8_t nSt = 0;
+  portENTER_CRITICAL(&pktMux);
   if (tmStNew) {
     tmStNew = false;
-    uint8_t b[16]; uint8_t n = tmStLen;
-    memcpy(b, (const void*)tmSt, n);
-    fmStatus->setValue(b, n);
+    nSt = tmStLen;
+    memcpy(bSt, (const void*)tmSt, nSt);
+  }
+  portEXIT_CRITICAL(&pktMux);
+  if (nSt > 0) {
+    fmStatus->setValue(bSt, nSt);
     fmStatus->notify();
   }
   if (fmGot) {                                        // حفظ مواصفات المشاية وإظهارها للتطبيقات
@@ -671,8 +693,21 @@ void onTemp(uint32_t now, float t) {
   // 3 قراءات متتالية فوق حد الخطر لتفعيل الحماية، والنزول تحت حد التحذير لإلغائها
   if (t >= hotC) { if (hotCnt < 255) hotCnt++; if (hotCnt >= 3) lockOn = true; }
   else hotCnt = 0;
-  hardStop = (t >= hotC + 5.0f);
-  if (lockOn && t < effWarn()) lockOn = false;
+
+  // تأكيد حد الإيقاف الفوري (قراءتان متتاليتان على الأقل فوق hotC + 5 لمنع التوقف المفاجئ الناتج عن تشويش الحساس)
+  static uint8_t hardCnt = 0;
+  if (t >= hotC + 5.0f) {
+    if (hardCnt < 255) hardCnt++;
+    if (hardCnt >= 2) hardStop = true;
+  } else {
+    hardCnt = 0;
+    hardStop = false;
+  }
+
+  if (lockOn && t < effWarn()) {
+    lockOn = false;
+    hardStop = false;
+  }
 
   snprintf(b, sizeof b, "Temp: %.2f C\n", t);
   Serial.print(b);
@@ -814,9 +849,16 @@ void setup() {
   fsvc->start();
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(NUS_SVC);
-  adv->addServiceUUID(U16(0x1826));
-  adv->setScanResponse(true);
+  // فصل الإعلان الرئيسي عن الاستجابة لتفادي تجاوز حد 31 بايت
+  NimBLEAdvertisementData advData;
+  advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+  advData.setCompleteServices(U16(0x1826));              // FTMS للتطبيقات الرياضية
+  advData.setName(DEV_NAME);                            // اسم الجهاز
+  adv->setAdvertisementData(advData);
+
+  NimBLEAdvertisementData scanData;
+  scanData.setCompleteServices(NimBLEUUID(NUS_SVC));    // خدمة UART لتطبيق الويب
+  adv->setScanResponseData(scanData);
   adv->start();
 
   xTaskCreate(guardTask, "guard", 8192, nullptr, 1, nullptr);
@@ -832,9 +874,9 @@ void loop() {
   if (pending && now - tReq >= 800)   { pending = false; onTemp(now, ds.getTempCByIndex(0)); }
 
   static uint32_t lastChk = 0;
-  if ((uint32_t)(now - lastChk) >= 1000) {            // لا أحد متصل: صفّر الحالات
+  if ((uint32_t)(now - lastChk) >= 1000) {            // فحص اشتراك تطبيق الويب في خدمة الحرارة
     lastChk = now;
-    if (gServer->getConnectedCount() == 0) connected = false;
+    if (txChar) connected = (txChar->getSubscribedCount() > 0);
   }
 
   static uint32_t lastClientMs = 0;

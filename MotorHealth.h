@@ -373,10 +373,11 @@ class Engine {
 
   void beginRun(uint32_t tm) {
     stt = RUN; stopCnt = 0; unkCnt = 0; coolN = 0; incomplete = false;
-    runTicks = 0; sumSpeed = 0; peakT = -1e9f;
+    runTicks = 0; sumSpeed = 0;
+    startT = (earlyN && eT[0] != NONE) ? eT[0] / 100.f : lastT;
+    lastRunT = (earlyN && eT[earlyN - 1] != NONE) ? eT[earlyN - 1] / 100.f : lastT;
+    peakT = (startT > -50.0f) ? startT : ((lastT > -50.0f) ? lastT : 25.0f);
     for (int i = 0; i < earlyN; i++) { runTicks++; sumSpeed += eS[i] / 10.f; if (eT[i] != NONE && eT[i] / 100.f > peakT) peakT = eT[i] / 100.f; }
-    startT = earlyN ? eT[0] / 100.f : lastT;
-    lastRunT = earlyN ? eT[earlyN - 1] / 100.f : lastT;
     uint32_t t0 = tm - (uint32_t)(earlyN ? earlyN - 1 : 0) * SAMPLE_MS;
     runStartEpoch = epochAt(t0);
     cold = computeCold(t0);
