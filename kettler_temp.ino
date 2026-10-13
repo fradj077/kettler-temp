@@ -261,6 +261,7 @@ uint8_t fmFeatB[8] = {0x0C, 0x10, 0, 0, 0x03, 0, 0, 0};          // مسافة+�
 uint8_t fmSpdB[6]  = {0x64, 0x00, 0xD0, 0x07, 0x32, 0x00};       // 1 إلى 20 كم/س، خطوة 0.5
 uint8_t fmIncB[6]  = {0x00, 0x00, 0x96, 0x00, 0x0A, 0x00};       // 0 إلى 15%، خطوة 1
 volatile bool fmGot = false;         // قرأت اللوحة مواصفات المشاية الحقيقية
+extern volatile bool tmLinked;       // إعلان مسبق للارتباط بالمشاية لتفادي خطأ البناء
 
 // نتيجة أمر التحكم: 1 نجاح، 2 غير مدعوم، 5 غير مسموح (الحماية فعّالة)
 uint8_t cpDecide(uint8_t op, bool lock, bool* fwd) {
