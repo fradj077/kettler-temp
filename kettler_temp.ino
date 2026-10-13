@@ -265,6 +265,9 @@ volatile bool fmGot = false;         // قرأت اللوحة مواصفات ا�
 // نتيجة أمر التحكم: 1 نجاح، 2 غير مدعوم، 5 غير مسموح (الحماية فعّالة)
 uint8_t cpDecide(uint8_t op, bool lock, bool* fwd) {
   *fwd = false;
+  if (!tmLinked) {
+    return 5; // التحكّم غير مسموح لأن المشاية الحقيقية غير متصلة بالوسيط بعد
+  }
   switch (op) {
     case 0x00: case 0x01: return 1;
     case 0x02: case 0x03: case 0x07: if (lock) return 5; *fwd = true; return 1;
