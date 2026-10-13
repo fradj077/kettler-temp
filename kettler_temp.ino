@@ -53,6 +53,7 @@ Preferences fmPrefs;
 Preferences cfgPrefs;
 Cfg cfg = {0.0f, 0.0f, 0.5f, 1.0f, 3.0f, 1, 0};
 volatile bool cfgDirty = false, cfgQuery = false;
+volatile uint32_t cfgDirtyMs = 0;
 mh::Engine mhe;
 
 // ---------- حدود الحرارة ----------
@@ -87,12 +88,12 @@ void handleLine(const char* l) {
   if (l[0] == 'K') {                       // إعدادات: KS سرعة، KI ميل، KA تسارع، KD تباطؤ، KT تحديد بالحرارة، KC دقائق المشي، KQ استعلام
     float v = atof(l + 2);
     switch (l[1]) {
-      case 'S': cfg.maxSpd = v < 0 ? 0 : (v > 40 ? 40 : v); cfgDirty = true; break;
-      case 'I': cfg.maxInc = v < 0 ? 0 : (v > 40 ? 40 : v); cfgDirty = true; break;
-      case 'A': cfg.accel = v < 0 ? 0 : (v > 5 ? 5 : v); cfgDirty = true; break;
-      case 'D': cfg.decel = v < 0 ? 0 : (v > 10 ? 10 : v); cfgDirty = true; break;
-      case 'T': cfg.capOn = v >= 0.5f ? 1 : 0; cfgDirty = true; break;
-      case 'C': cfg.cdMin = (uint8_t)(v < 0 ? 0 : (v > 30 ? 30 : v)); cfgDirty = true; break;
+      case 'S': cfg.maxSpd = v < 0 ? 0 : (v > 40 ? 40 : v); cfgDirty = true; cfgDirtyMs = millis(); break;
+      case 'I': cfg.maxInc = v < 0 ? 0 : (v > 40 ? 40 : v); cfgDirty = true; cfgDirtyMs = millis(); break;
+      case 'A': cfg.accel = v < 0 ? 0 : (v > 5 ? 5 : v); cfgDirty = true; cfgDirtyMs = millis(); break;
+      case 'D': cfg.decel = v < 0 ? 0 : (v > 10 ? 10 : v); cfgDirty = true; cfgDirtyMs = millis(); break;
+      case 'T': cfg.capOn = v >= 0.5f ? 1 : 0; cfgDirty = true; cfgDirtyMs = millis(); break;
+      case 'C': cfg.cdMin = (uint8_t)(v < 0 ? 0 : (v > 30 ? 30 : v)); cfgDirty = true; cfgDirtyMs = millis(); break;
       case 'Q': cfgQuery = true; break;
     }
     return;
@@ -573,8 +574,6 @@ bool wantLink(uint32_t now, bool lock, bool manual, uint32_t ftmsAct, uint32_t d
   if (lock) return true;
   // إذا لم يكن الهاتف متصلًا باللوحة أصلاً، لا تقم بالمسح إطلاقاً لكي يظل راديو البلوتوث حراً ويستقبل اتصال الهاتف فوراً
   if (!gServer || gServer->getConnectedCount() == 0) return false;
-  bool userOff = dOff && (uint32_t)(now - dOff) < 60000UL;
-  if (!gone && !userOff) return true;
   if (manual && !gone) return true;
   bool appSince = ftmsAct && (!dOff || (int32_t)(ftmsAct - dOff) > 0);
   if (moving && appSince && !gone) return true;
@@ -747,8 +746,17 @@ void cfgSend() {
   sendLong(b);
 }
 void cfgPump() {
-  if (cfgDirty) { cfgDirty = false; cfgSave(); if (connected) cfgSend(); }
-  if (cfgQuery) { cfgQuery = false; if (connected) cfgSend(); }
+  if (cfgQuery) {
+    cfgQuery = false;
+    if (cfgDirty) { cfgDirty = false; cfgSave(); }
+    if (connected) cfgSend();
+    return;
+  }
+  if (cfgDirty && (uint32_t)(millis() - cfgDirtyMs) >= 250) {
+    cfgDirty = false;
+    cfgSave();
+    if (connected) cfgSend();
+  }
 }
 
 // تنبؤ: ميل الحرارة آخر 6 دقائق (عينة كل 10 ثوانٍ) -> متى نبلغ حد التحذير أو الخطر
