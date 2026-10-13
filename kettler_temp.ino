@@ -354,12 +354,12 @@ void cpNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
 
 class ScanCb : public NimBLEAdvertisedDeviceCallbacks {
   void onResult(NimBLEAdvertisedDevice* d) {
-    bool ok = d->isAdvertisingService(U16(0x1826));
-    if (!ok) {
-      std::string nm = d->getName();
-      for (size_t i = 0; i < nm.size(); i++) nm[i] = toupper((unsigned char)nm[i]);
-      if (nm.find("KETTLER") != std::string::npos && nm.find("TEMP") == std::string::npos) ok = true;
-    }
+    std::string nm = d->getName();
+    for (size_t i = 0; i < nm.size(); i++) nm[i] = toupper((unsigned char)nm[i]);
+    // استبعاد اللوحة نفسها قطعيًا لتفادي محاولة الاتصال بنفسها والتأخير
+    if (nm.find("TEMP") != std::string::npos) return;
+
+    bool ok = d->isAdvertisingService(U16(0x1826)) || (nm.find("KETTLER") != std::string::npos);
     if (ok) {
       tmAddr = d->getAddress();
       tmFound = true;
@@ -386,7 +386,7 @@ bool tmConnect() {
   sc->setActiveScan(true);
   sc->setInterval(100);
   sc->setWindow(80);
-  sc->start(6, false);
+  sc->start(3, false); // 3 ثوانٍ تكفي تمامًا لالتقاط المشاية بسرعة
   sc->clearResults();
   if (!tmFound) return false;
   if (!tmClient) { tmClient = NimBLEDevice::createClient(); tmClient->setConnectTimeout(8); }
@@ -414,8 +414,7 @@ bool tmConnect() {
 
 void ensureCtrl() {
   if (needCtrl && tmCp) {
-    bool resp = tmCp->canWrite();
-    tmCp->writeValue(CMD_REQ, 1, resp);
+    tmCp->writeValue(CMD_REQ, 1, false);
     needCtrl = false;
     vTaskDelay(pdMS_TO_TICKS(300));
   }
@@ -464,8 +463,7 @@ bool speedFresh() { return (uint32_t)(millis() - tmSpeedMs) < 4000; }
 void sendRaw(const uint8_t* d, size_t n) {
   if (!tmCp) return;
   ensureCtrl();
-  bool resp = tmCp->canWrite();
-  tmCp->writeValue(d, n, resp);
+  tmCp->writeValue(d, n, false);
   vTaskDelay(pdMS_TO_TICKS(40));
 }
 void shaperReset() { reqSpeed = -1.0f; outSpeed = -1.0f; lastSentSpd = -1.0f; cdActive = false; }
@@ -569,6 +567,10 @@ size_t lockDecide(LockState& s, uint32_t now, bool fresh, float cur, bool hard, 
 // قليلة (عند تغيّر المرحلة فقط)، وقطع الاتصال بعد 20 ثانية من الصمت كان يوقف المشاية أثناء البرنامج.
 bool wantLink(uint32_t now, bool lock, bool manual, uint32_t ftmsAct, uint32_t dOff, float temp, float warn, bool gone, bool moving) {
   if (lock) return true;
+  // إذا لم يكن الهاتف متصلًا باللوحة أصلاً، لا تقم بالمسح إطلاقاً لكي يظل راديو البلوتوث حراً ويستقبل اتصال الهاتف فوراً
+  if (!gServer || gServer->getConnectedCount() == 0) return false;
+  bool userOff = dOff && (uint32_t)(now - dOff) < 60000UL;
+  if (!gone && !userOff) return true;
   if (manual && !gone) return true;
   bool appSince = ftmsAct && (!dOff || (int32_t)(ftmsAct - dOff) > 0);
   if (moving && appSince && !gone) return true;
@@ -598,7 +600,7 @@ void guardTask(void*) {
         if (fresh || (uint32_t)(now - linkAt) >= 2500) {
           uint8_t cmd[3];
           size_t n = lockDecide(ls, now, fresh, tmSpeed, hardStop, cmd);
-          if (n && tmCp) { ensureCtrl(); bool resp = tmCp->canWrite(); tmCp->writeValue(cmd, n, resp); }
+          if (n && tmCp) { ensureCtrl(); tmCp->writeValue(cmd, n, false); }
         }
         fwdT = fwdH;                                  // أوامر التطبيقات مرفوضة أثناء الحماية
         shaperReset();
