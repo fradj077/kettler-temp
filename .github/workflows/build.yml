@@ -23,16 +23,11 @@ jobs:
           echo "Using sketch: $F"
           cp "$F" sketch/kettler_temp/kettler_temp.ino
           cp MotorHealth.h sketch/kettler_temp/
-          arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=default_16MB,FlashMode=qio --output-dir out sketch/kettler_temp
+          arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,FlashMode=qio --output-dir out sketch/kettler_temp
       - name: Collect firmware
         run: |
           mkdir -p merged
           pip install esptool
           BOOT_APP0=$(find ~/.arduino15 -name boot_app0.bin | head -1)
           echo "boot_app0: $BOOT_APP0"
-          python -m esptool --chip esp32s3 merge_bin -o merged/kettler_temp_full.bin --flash_mode keep --flash_size 16MB 0x0 out/kettler_temp.ino.bootloader.bin 0x8000 out/kettler_temp.ino.partitions.bin 0xe000 "$BOOT_APP0" 0x10000 out/kettler_temp.ino.bin
-          cp out/kettler_temp.ino.bin merged/kettler_temp_app.bin
-      - uses: actions/upload-artifact@v4
-        with:
-          name: firmware
-          path: merged
+          python -m esptool --chip esp32s3 merge_bin -o merged/kettler_temp_full.bin --flash_mode keep --flash_size
