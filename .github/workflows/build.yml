@@ -30,4 +30,9 @@ jobs:
           pip install esptool
           BOOT_APP0=$(find ~/.arduino15 -name boot_app0.bin | head -1)
           echo "boot_app0: $BOOT_APP0"
-          python -m esptool --chip esp32s3 merge_bin -o merged/kettler_temp_full.bin --flash_mode keep --flash_size
+          python -m esptool --chip esp32s3 merge_bin -o merged/kettler_temp_full.bin --flash_mode keep --flash_size 16MB 0x0 out/kettler_temp.ino.bootloader.bin 0x8000 out/kettler_temp.ino.partitions.bin 0xe000 "$BOOT_APP0" 0x10000 out/kettler_temp.ino.bin
+          cp out/kettler_temp.ino.bin merged/kettler_temp_app.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: merged
