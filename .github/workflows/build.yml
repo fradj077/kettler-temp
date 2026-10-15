@@ -1,4 +1,4 @@
-name: Build ESP32-S3 firmware
+name: Build N16R8
 on:
   workflow_dispatch:
 jobs:
