@@ -1,3 +1,20 @@
+// ============================================================================
+// كود لوحة Kettler-Temp المخصص لشريحة ESP32-S3 N16 (16MB Flash / Dual Core LX7)
+// ----------------------------------------------------------------------------
+// إعدادات البناء والترجمة في Arduino IDE:
+//   - Board: "ESP32S3 Dev Module"
+//   - Flash Size: "16MB (128Mb)"
+//   - Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)" أو "app3M_fat9M_16MB"
+//   - Flash Mode: "QIO 80MHz" أو "DIO 80MHz"
+//   - PSRAM: "OPI PSRAM" (إذا كانت N16R8) أو "Disabled" (إذا كانت N16 فقط)
+//   - CPU Frequency: "240MHz (WiFi/BT)"
+//   - Upload Speed: 921600
+// ----------------------------------------------------------------------------
+// توزيع الموارد على الشريحة:
+//   - Core 0: معالجة الـ DSP وتيار ACS758 بسرعة 8.33 kHz (dspTask)
+//   - Core 1: بروتوكول البلوتوث (NimBLE Stack) ومراقبة الحماية وقراءة الحرارة
+//   - ADC1 (GPIO 5): قراءة مستمرة ومستقلة تماماً لا تتأثر بالبلوتوث إطلاقاً
+// ============================================================================
 // Kettler-Temp v3 : ESP32-S3 + DS18B20 (GPIO 4)
 //  * يرسل حرارة المحرك للتطبيق عبر Nordic UART  "Temp: 26.44 C"
 //  * وسيط FTMS: يظهر لتطبيقات مثل Kinomap وZwift كمشاية، ويمرّر أوامرها إلى المشاية الحقيقية
@@ -12,8 +29,10 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "MotorHealth.h"
+#include "MotorCurrentDSP.h"
 
 #define PIN_DS   4
+#define PIN_ACS  5
 #define NUS_SVC  "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define NUS_RX   "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define NUS_TX   "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -51,10 +70,21 @@ Preferences mhPrefs;
 Preferences limPrefs;
 Preferences fmPrefs;
 Preferences cfgPrefs;
+Preferences dspPrefs;
+volatile bool dspDirty = false, dspQuery = false;
+volatile uint32_t dspDirtyMs = 0;
 Cfg cfg = {0.0f, 0.0f, 0.5f, 1.0f, 3.0f, 1, 0};
 volatile bool cfgDirty = false, cfgQuery = false;
 volatile uint32_t cfgDirtyMs = 0;
 mh::Engine mhe;
+dsp::MotorCurrentDSP dspEngine;
+
+void dspTask(void*) {
+  for (;;) {
+    dspEngine.processBurst(millis(), tmSpeed);
+    vTaskDelay(pdMS_TO_TICKS(180));
+  }
+}
 
 // ---------- حدود الحرارة ----------
 float warnC = 60.0f, hotC = 80.0f;
@@ -82,7 +112,18 @@ void sendLine(const char* s) { mhTx(s, strlen(s)); }
 char lineBuf[48];
 size_t lineLen = 0;
 void handleLine(const char* l) {
-  if (l[0] == 'M') { mhe.pushCommand(l); return; }
+  if (l[0] == 'I' && l[1] == 'Z') { dspEngine.calibrateZero(200); return; }
+  if (l[0] == 'I' && l[1] == 'S') { dspEngine.resetSteps(); return; }
+  if (l[0] == 'I' && l[1] == 'A') { dspEngine.resetArcingScore(); return; }
+  if (l[0] == 'M') {
+    if (l[1] == 'M') {
+      dspEngine.onMaintenanceLubricated();
+      dspDirty = true;
+      dspDirtyMs = millis();
+    }
+    mhe.pushCommand(l);
+    return;
+  }
   if (l[0] == 'W') { float v = atof(l + 1); if (v >= 20 && v <= 120) pendW = v; return; }
   if (l[0] == 'H') { float v = atof(l + 1); if (v >= 20 && v <= 120) pendH = v; return; }
   if (l[0] == 'K') {                       // إعدادات: KS سرعة، KI ميل، KA تسارع، KD تباطؤ، KT تحديد بالحرارة، KC دقائق المشي، KQ استعلام
@@ -97,6 +138,73 @@ void handleLine(const char* l) {
       case 'Q': cfgQuery = true; break;
     }
     return;
+  }
+  if (l[0] == 'P') { // ضبط هوامش ومعايرة الـ DSP: PF, PL, PD, PK, PW, PC, PB, PT, PS, PV, PQ, PR
+    if (l[1] == 'Q') { dspQuery = true; return; }
+    if (l[1] == 'R') { dspEngine.resetConfigToDefaults(); dspDirty = true; dspDirtyMs = millis(); return; }
+    float v = atof(l + 2);
+    auto c = dspEngine.getConfig();
+    switch (l[1]) {
+      case 'F': c.ratedCurrentA = constrain(v, 5.0f, 25.0f); break;
+      case 'L': c.stallLimitA   = constrain(v, 8.0f, 25.0f); break;
+      case 'D': c.stallDelayMs  = (uint16_t)constrain(v, 100.0f, 1500.0f); break;
+      case 'K': c.kurtosisThresh = constrain(v, 4.0f, 12.0f); break;
+      case 'W': c.cusumWarnScore = constrain(v, 5.0f, 50.0f); break;
+      case 'C': c.cusumCritScore = constrain(v, 20.0f, 90.0f); break;
+      case 'B': c.emptyBeltWarnA = constrain(v, 1.5f, 6.0f); break;
+      case 'T': c.stepDeltaA     = constrain(v, 0.08f, 0.80f); break;
+      case 'S': c.sensMvPerA     = constrain(v, 15.0f, 45.0f); break;
+      case 'V': c.nominalBusV    = constrain(v, 90.0f, 240.0f); break;
+    }
+    dspEngine.setConfig(c);
+    dspDirty = true;
+    dspDirtyMs = millis();
+    return;
+  }
+  if (l[0] == 'B') { // أوامر النسخ الاحتياطي والاستعادة لحماية العدادات والمعايرات
+    if (l[1] == 'K' && l[2] == 'Q') { // BKQ: طلب تصدير النسخة الاحتياطية الشاملة
+      char b[160];
+      auto c = dspEngine.getConfig();
+      snprintf(b, sizeof b, "BKP:H=%lu,M=%lu,N=%u,E=%.2f,S=%lu,BL=%.2f,STL=%.1f,W=%.1f,K=%.1f\n",
+               (unsigned long)mhe.st.totalSec, (unsigned long)mhe.st.maintSec,
+               (unsigned)mhe.st.count, dspEngine.getCumulativeEnergyKWh(),
+               (unsigned long)dspEngine.getCumulativeSteps(),
+               c.calibratedBaselineA, c.stallLimitA, warnC, hotC);
+      sendLong(b);
+      return;
+    }
+    if (l[1] == 'K' && l[2] == 'R') { // BKR: استعادة العدادات والمعايرة
+      const char* p = l + 4;
+      float ekwh = -1.0f; long steps = -1; float bl = -1.0f;
+      unsigned long totSec = 0, maintSec = 0;
+      char copy[128]; strncpy(copy, p, sizeof copy - 1); copy[sizeof copy - 1] = 0;
+      char* tok = strtok(copy, ",");
+      while (tok) {
+        if (tok[0] == 'H' && tok[1] == '=') totSec = strtoul(tok + 2, 0, 10);
+        else if (tok[0] == 'M' && tok[1] == '=') maintSec = strtoul(tok + 2, 0, 10);
+        else if (tok[0] == 'E' && tok[1] == '=') ekwh = atof(tok + 2);
+        else if (tok[0] == 'S' && tok[1] == '=') steps = strtol(tok + 2, 0, 10);
+        else if (tok[0] == 'B' && tok[1] == 'L' && tok[2] == '=') bl = atof(tok + 3);
+        tok = strtok(0, ",");
+      }
+      if (totSec > 0) mhe.st.totalSec = totSec;
+      if (maintSec > 0) mhe.st.maintSec = maintSec;
+      mhe.save();
+      if (ekwh >= 0.0f || steps >= 0) {
+        float curE = ekwh >= 0.0f ? ekwh : dspEngine.getCumulativeEnergyKWh();
+        uint32_t curS = steps >= 0 ? (uint32_t)steps : dspEngine.getCumulativeSteps();
+        dspEngine.loadCumulativeCounters(curE, curS);
+      }
+      if (bl >= 0.5f && bl <= 5.0f) {
+        auto c = dspEngine.getConfig();
+        c.calibratedBaselineA = bl;
+        c.emptyBeltWarnA = bl * 1.55f;
+        dspEngine.setConfig(c);
+      }
+      dspSave();
+      sendLine("BKR:OK\n");
+      return;
+    }
   }
   if (l[0] == 'C') { manualLink = true; dOffAt = 0; return; }
   if (l[0] == 'D') { manualLink = false; dOffAt = millis() | 1; return; }
@@ -758,6 +866,48 @@ void cfgPump() {
     if (connected) cfgSend();
   }
 }
+void dspSave() {
+  auto c = dspEngine.getConfig();
+  dspPrefs.putBytes("c", &c, sizeof c);
+  dspPrefs.putFloat("ekwh", dspEngine.getCumulativeEnergyKWh());
+  dspPrefs.putUInt("steps", dspEngine.getCumulativeSteps());
+}
+void dspLoad() {
+  dsp::DspConfig t = dspEngine.getDefaultConfig();
+  size_t storedLen = dspPrefs.getBytesLength("c");
+  if (storedLen > 0) {
+    size_t toRead = storedLen < sizeof(t) ? storedLen : sizeof(t);
+    dspPrefs.getBytes("c", &t, toRead);
+    dspEngine.setConfig(t);
+  }
+  float savedKWh = dspPrefs.getFloat("ekwh", 0.0f);
+  uint32_t savedSteps = dspPrefs.getUInt("steps", 0);
+  dspEngine.loadCumulativeCounters(savedKWh, savedSteps);
+}
+void dspSend() {
+  char b[140];
+  auto c = dspEngine.getConfig();
+  snprintf(b, sizeof b, "IPC:F=%.1f,L=%.1f,D=%u,K=%.1f,W=%.1f,C=%.1f,B=%.1f,T=%.2f,S=%.1f,V=%.1f,BL=%.2f
+",
+           c.ratedCurrentA, c.stallLimitA, (unsigned)c.stallDelayMs,
+           c.kurtosisThresh, c.cusumWarnScore, c.cusumCritScore,
+           c.emptyBeltWarnA, c.stepDeltaA, c.sensMvPerA, c.nominalBusV, c.calibratedBaselineA);
+  sendLong(b);
+}
+void dspPump() {
+  if (dspQuery) {
+    dspQuery = false;
+    if (dspDirty) { dspDirty = false; dspSave(); }
+    if (connected) dspSend();
+    return;
+  }
+  if (dspDirty && (uint32_t)(millis() - dspDirtyMs) >= 250) {
+    dspDirty = false;
+    dspSave();
+    if (connected) dspSend();
+  }
+}
+
 
 // تنبؤ: ميل الحرارة آخر 6 دقائق (عينة كل 10 ثوانٍ) -> متى نبلغ حد التحذير أو الخطر
 float predBuf[36]; int predN = 0; int predShown = -2; float capShown = -1.0f;
@@ -819,6 +969,8 @@ void setup() {
 
   cfgPrefs.begin("cfg", false);
   cfgLoad();
+  dspPrefs.begin("dsp", false);
+  dspLoad();
 
   fmPrefs.begin("fm", false);
   {
@@ -875,6 +1027,8 @@ void setup() {
   adv->setScanResponseData(scanData);
   adv->start();
 
+  dspEngine.begin(PIN_ACS, 180.0f, 26.4f);
+  xTaskCreatePinnedToCore(dspTask, "dspTask", 4096, nullptr, 2, nullptr, 0);
   xTaskCreate(guardTask, "guard", 8192, nullptr, 1, nullptr);
 }
 
@@ -905,8 +1059,34 @@ void loop() {
       sendStatus();
     }
   }
+  static uint32_t lastCurMs = 0;
+  if (connected && (uint32_t)(now - lastCurMs) >= 500) {
+    lastCurMs = now;
+    auto m = dspEngine.getMetrics();
+    char b[128];
+    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f
+",
+             m.currentA, m.kurtosis, (int)m.brushHealth, m.powerWatts,
+             (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct);
+    sendLine(b);
+    if (m.stallAlert) {
+      hardStop = true;
+      lockOn = true;
+    }
+  }
+  static uint32_t lastCounterSaveMs = 0;
+  static bool wasMoving = false;
+  bool isMoving = (tmSpeed > 0.3f);
+  if ((uint32_t)(now - lastCounterSaveMs) >= 60000 || (wasMoving && !isMoving)) {
+    lastCounterSaveMs = now;
+    dspPrefs.putFloat("ekwh", dspEngine.getCumulativeEnergyKWh());
+    dspPrefs.putUInt("steps", dspEngine.getCumulativeSteps());
+  }
+  wasMoving = isMoving;
+
   bridgePump(now);
   cfgPump();
+  dspPump();
   predictPump(now);
   capPump();
   otaPump();
