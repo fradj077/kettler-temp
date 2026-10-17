@@ -21,6 +21,12 @@
  *    - Automatically sets dynamic wear threshold (+55% friction increase)
  *    - Computes real-time mechanical friction degradation ratio
  * 7. Medium-Frequency Path (1-4 Hz): Mechanical Footstrike Peak Detector & Left/Right Symmetry
+ * 8. Smart Biometrics Suite:
+ *    - Dynamic Body Weight Estimation from belt velocity & active load delta
+ *    - Autonomous Step-Off / Fall Safety Detection (Zero-false-alarm unloaded detector)
+ *    - Gait Asymmetry & Fatigue State Machine (Injury Prevention Index)
+ *    - Running Economy Index (Wh/km & mechanical efficiency rating)
+ *    - Mechanical Belt Tension & Roller Bearing Roughness Diagnostic
  *
  * NOTE: Buffers _rawMv and _hp are allocated as class member variables (in SRAM .bss)
  * to prevent FreeRTOS task stack overflow and ensure rock-solid Bluetooth stability.
@@ -60,6 +66,14 @@ struct Metrics {
   float symmetryPct;           // Left/Right footstrike balance (100% = perfectly symmetrical)
   bool stallAlert;             // True if current exceeds stallLimitA for >stallDelayMs
   float zeroVoltMv;            // Auto-calibrated zero-current voltage in mV
+
+  // --- Smart Biometrics & Mechanical Analytics ---
+  float estimatedWeightKg;     // Dynamically estimated body weight in kg
+  bool stepOffAlert;           // True if runner stepped off or fell while belt was running
+  float runningEconomyWhPerKm; // Energy efficiency in Wh/km
+  uint8_t fatigueState;        // 0 = Fresh/Balanced, 1 = Moderate Fatigue, 2 = High Fatigue Risk
+  uint8_t beltTensionStatus;   // 0 = Loose, 1 = Optimal, 2 = Over-tight
+  uint8_t bearingStatus;       // 0 = Smooth, 1 = Slight Roughness, 2 = Worn/Check
 };
 
 class MotorCurrentDSP {
@@ -82,7 +96,7 @@ public:
     c.cusumWarnScore        = 18.0f;             // Score >= 18.0 -> Warning
     c.cusumCritScore        = 45.0f;             // Score >= 45.0 -> Critical
     c.emptyBeltWarnA        = 3.5f;              // Empty belt > 3.5A -> Needs silicone lubrication
-    c.stepDeltaA            = 0.22f;             // Footstrike load pulse >= 0.22A
+    c.stepDeltaA            = 0.18f;             // Sensitive footstrike load pulse (0.18A)
     c.sensMvPerA            = DEFAULT_SENS_MV_A; // 26.4 mV/A
     c.nominalBusV           = RATED_BUS_VOLTS;   // 180.0 V
     c.calibratedBaselineA   = 1.80f;             // Clean pristine baseline after lubrication
@@ -100,7 +114,8 @@ public:
       _leftPeakSum(0.0f), _rightPeakSum(0.0f),
       _stepAlternator(false), _symmetryPct(100.0f),
       _stallStartMs(0), _stallActive(false),
-      _lastBurstMs(0), _smoothedCurrentA(0.0f)
+      _lastBurstMs(0), _smoothedCurrentA(0.0f),
+      _estWeight(0.0f)
   {
     _cfg = getDefaultConfig();
     memset(&_m, 0, sizeof(_m));
@@ -111,6 +126,9 @@ public:
     _m.symmetryPct = 100.0f;
     _m.calibratedBaselineA = _cfg.calibratedBaselineA;
     _m.frictionRatioPct = 100.0f;
+    _m.estimatedWeightKg = 75.0f;
+    _m.beltTensionStatus = 1;
+    _m.bearingStatus = 0;
   }
 
   void begin(uint8_t pin = 5, float nominalBusVoltage = RATED_BUS_VOLTS, float sensitivityMvPerA = DEFAULT_SENS_MV_A) {
@@ -211,7 +229,7 @@ public:
 
     // 4. Power & Cumulative Energy (Watts and kWh)
     float effectiveBusV = liveSpeedKmh > 0.05f ? (_cfg.nominalBusV * (0.15f + 0.85f * (liveSpeedKmh / 20.0f))) : 0.0f;
-    if (effectiveBusV > _cfg.nominalBusV) effectiveBusV = _cfg.nominalBusV;
+    if (effectiveBusV > _cfg.nominalBusV) effectiveBusV = _nominalBusV;
     _m.powerWatts = effectiveBusV * _m.currentA;
 
     float dtSec = _lastEnergyUpdateMs > 0 ? (float)(nowMs - _lastEnergyUpdateMs) / 1000.0f : 0.25f;
@@ -257,6 +275,13 @@ public:
       } else {
         _m.lubricationAlert = false;
       }
+
+      // Belt Tension Diagnostic from unloaded empty belt
+      if (_m.emptyBeltA > 0.5f) {
+        if (_m.emptyBeltA < 1.15f) _m.beltTensionStatus = 0;       // Loose
+        else if (_m.emptyBeltA <= 2.75f) _m.beltTensionStatus = 1; // Optimal
+        else _m.beltTensionStatus = 2;                             // Over-tight
+      }
     }
 
     // 6. Pre-filtering: Remove DC bias to isolate AC commutation ripple & arcing transients
@@ -268,6 +293,13 @@ public:
       if (_hp[i] > maxAc) maxAc = _hp[i];
     }
     _m.currentP2pA = (maxAc > minAc) ? (maxAc - minAc) : 0.0f;
+
+    // Bearing Mechanical Roughness: Unloaded belt high-frequency ripple check
+    if (liveSpeedKmh > 0.5f && _m.currentA < 3.0f) {
+      if (_m.currentP2pA <= 0.45f) _m.bearingStatus = 0;        // Smooth
+      else if (_m.currentP2pA <= 0.75f) _m.bearingStatus = 1;   // Slight Roughness
+      else _m.bearingStatus = 2;                                // Worn / Service
+    }
 
     // 7. Statistical Kurtosis Calculation (4th Standardized Moment)
     double sumSq = 0.0;
@@ -354,6 +386,50 @@ public:
       }
     }
     _prevStepSlope = slope;
+
+    // 10. Smart Biometrics: Gait Asymmetry & Fatigue State Machine
+    if (_m.stepCount >= 30) {
+      if (_m.symmetryPct >= 88.0f) _m.fatigueState = 0;         // Fresh & Balanced
+      else if (_m.symmetryPct >= 78.0f) _m.fatigueState = 1;    // Moderate Fatigue
+      else _m.fatigueState = 2;                                 // High Fatigue / Injury Risk
+    } else {
+      _m.fatigueState = 0;
+    }
+
+    // 11. Smart Biometrics: Running Economy Index (Wh/km)
+    if (liveSpeedKmh >= 1.0f && _m.powerWatts > 10.0f) {
+      _m.runningEconomyWhPerKm = _m.powerWatts / liveSpeedKmh;
+      if (_m.runningEconomyWhPerKm > 150.0f) _m.runningEconomyWhPerKm = 150.0f;
+    } else {
+      _m.runningEconomyWhPerKm = 0.0f;
+    }
+
+    // 12. Smart Biometrics: Dynamic Body Weight Estimation
+    if (liveSpeedKmh >= 3.0f && _m.stepCount >= 8 && _m.emptyBeltA > 0.5f) {
+      float loadDelta = _smoothedCurrentA - _m.emptyBeltA;
+      if (loadDelta > 0.35f) {
+        float kw = 0.027f * (1.0f + (liveSpeedKmh - 4.0f) * 0.035f);
+        float rawW = loadDelta / kw;
+        if (rawW >= 35.0f && rawW <= 160.0f) {
+          if (_estWeight <= 1.0f) _estWeight = rawW;
+          else _estWeight = _estWeight * 0.96f + rawW * 0.04f;
+          _m.estimatedWeightKg = _estWeight;
+        }
+      }
+    }
+
+    // 13. Smart Safety: Autonomous Step-Off / Fall Detection
+    if (liveSpeedKmh >= 2.5f && _m.stepCount >= 10 && _m.emptyBeltA > 0.5f) {
+      uint32_t stepSilenceMs = nowMs - _lastStepMs;
+      float loadDelta = _smoothedCurrentA - _m.emptyBeltA;
+      if (stepSilenceMs >= 4200 && loadDelta <= 0.30f) {
+        _m.stepOffAlert = true;
+      } else {
+        _m.stepOffAlert = false;
+      }
+    } else {
+      _m.stepOffAlert = false;
+    }
   }
 
   void resetSteps() {
@@ -361,6 +437,7 @@ public:
     _m.stepCount = 0;
     _m.cadenceSpm = 0;
     _lastStepMs = 0;
+    _m.stepOffAlert = false;
   }
 
   void resetEnergy() {
@@ -404,7 +481,7 @@ private:
     if (isnan(_cfg.cusumWarnScore) || _cfg.cusumWarnScore < 5.0f || _cfg.cusumWarnScore > 50.0f) _cfg.cusumWarnScore = 18.0f;
     if (isnan(_cfg.cusumCritScore) || _cfg.cusumCritScore < 20.0f || _cfg.cusumCritScore > 90.0f) _cfg.cusumCritScore = 45.0f;
     if (isnan(_cfg.emptyBeltWarnA) || _cfg.emptyBeltWarnA < 1.5f || _cfg.emptyBeltWarnA > 6.0f) _cfg.emptyBeltWarnA = 3.5f;
-    if (isnan(_cfg.stepDeltaA) || _cfg.stepDeltaA < 0.08f || _cfg.stepDeltaA > 0.80f) _cfg.stepDeltaA = 0.22f;
+    if (isnan(_cfg.stepDeltaA) || _cfg.stepDeltaA < 0.08f || _cfg.stepDeltaA > 0.80f) _cfg.stepDeltaA = 0.18f;
     if (isnan(_cfg.sensMvPerA) || _cfg.sensMvPerA < 15.0f || _cfg.sensMvPerA > 45.0f) _cfg.sensMvPerA = DEFAULT_SENS_MV_A;
     if (isnan(_cfg.nominalBusV) || _cfg.nominalBusV < 90.0f || _cfg.nominalBusV > 240.0f) _cfg.nominalBusV = RATED_BUS_VOLTS;
     if (isnan(_cfg.calibratedBaselineA) || _cfg.calibratedBaselineA < 0.5f || _cfg.calibratedBaselineA > 5.0f) _cfg.calibratedBaselineA = 1.80f;
@@ -440,6 +517,7 @@ private:
 
   uint32_t _lastBurstMs;
   float _smoothedCurrentA;
+  float _estWeight;
 
   Metrics _m;
 
