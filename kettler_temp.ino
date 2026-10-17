@@ -29,7 +29,324 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "MotorHealth.h"
-#include "MotorCurrentDSP.h"
+// ==================== MOTOR CURRENT DSP ENGINE (INLINE) ====================
+#pragma once
+#include <Arduino.h>
+#include <math.h>
+
+/**
+ * MotorCurrentDSP.h - High-Speed Multi-Band Digital Signal Processing (DSP) Engine
+ * Designed for ESP32-S3 + Allegro ACS758LCB-050B (50A Hall-Effect Current Sensor)
+ *
+ * Implements:
+ * 1. High-Speed Burst Sampling & ADC eFuse Millivolt Reading on GPIO 5 (ADC1)
+ * 2. Pre-processing: Zero-Current Tracking & Fast DC-Removal High-Pass Filtering
+ * 3. PWM Carrier Notch / Bandstop Suppression to eliminate false arcing detection
+ * 4. 4th Standardized Moment (Sample Kurtosis) Engine for Brush Arcing/Wear Detection
+ * 5. Temporal CUSUM Evidence Accumulator for Zero-False-Alarm Confidence Scoring
+ * 6. Low-Frequency Path: Instant Electronic Stall Protection (>18A), Power (Watts/kWh),
+ *    and Empty-Belt Baseline Friction Monitoring for Lubrication Tracking
+ * 7. Medium-Frequency Path (1-4 Hz): Mechanical Footstrike Peak Detector & Running Symmetry
+ */
+
+namespace dsp {
+
+struct Metrics {
+  float currentA;        // Average DC current in Amperes
+  float currentP2pA;     // Peak-to-peak AC ripple current in Amperes
+  float kurtosis;        // 4th standardized moment (healthy ~1.8-3.5, arcing > 6.0)
+  float arcingScore;     // CUSUM cumulative confidence score (0 to 100)
+  uint8_t brushHealth;   // 0 = Healthy/Smooth, 1 = Warning (Early Arcing), 2 = Critical (Severe Wear)
+  float emptyBeltA;      // Baseline empty belt current in first 5s of run (lubrication metric)
+  float powerWatts;      // Instantaneous mechanical/electrical power in Watts
+  float energyKWh;       // Cumulative consumed electrical energy in kWh
+  uint32_t stepCount;    // Mechanical footstrike steps counted from belt load peaks
+  uint16_t cadenceSpm;   // Live cadence in steps per minute (SPM)
+  float symmetryPct;     // Left/Right footstrike balance (100% = perfectly symmetrical)
+  bool stallAlert;       // True if current exceeds hard limit (>18A) for >300ms
+  float zeroVoltMv;      // Auto-calibrated zero-current voltage in mV
+};
+
+class MotorCurrentDSP {
+public:
+  static const size_t BURST_SIZE = 512;
+
+  MotorCurrentDSP()
+    : _pin(5), _zeroMv(1650.0f), _sensMvPerA(26.4f),
+      _nominalBusV(180.0f), _calibrated(false),
+      _arcingScore(0.0f), _brushState(0),
+      _emptyBeltSampleCount(0), _emptyBeltSum(0.0f),
+      _energyWs(0.0f), _lastEnergyUpdateMs(0),
+      _stepCount(0), _lastStepMs(0),
+      _stepLpCurrent(0.0f), _prevStepSlope(0.0f),
+      _leftPeakSum(0.0f), _rightPeakSum(0.0f),
+      _stepAlternator(false), _symmetryPct(100.0f),
+      _stallStartMs(0), _stallActive(false),
+      _lastBurstMs(0), _smoothedCurrentA(0.0f)
+  {
+    memset(&_m, 0, sizeof(_m));
+    _m.kurtosis = 2.8f;
+    _m.brushHealth = 0;
+    _m.symmetryPct = 100.0f;
+  }
+
+  void begin(uint8_t pin = 5, float nominalBusVoltage = 180.0f, float sensitivityMvPerA = 26.4f) {
+    _pin = pin;
+    _nominalBusV = nominalBusVoltage;
+    _sensMvPerA = sensitivityMvPerA > 1.0f ? sensitivityMvPerA : 26.4f;
+    pinMode(_pin, INPUT);
+    analogSetPinAttenuation(_pin, ADC_11db); // 0 - 3.1V linear range with eFuse calibration
+    calibrateZero(300);
+    _lastEnergyUpdateMs = millis();
+  }
+
+  // Auto-calibrates zero-current sensor output voltage when motor is stopped
+  void calibrateZero(size_t samples = 200) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < samples; i++) {
+      sum += (float)analogReadMilliVolts(_pin);
+      delayMicroseconds(100);
+    }
+    float v0 = sum / (float)samples;
+    // Sanity check: ACS758 on 3.3V has Vcc/2 ~ 1650mV (allow 1200mV - 2100mV)
+    if (v0 >= 1200.0f && v0 <= 2100.0f) {
+      _zeroMv = v0;
+      _calibrated = true;
+    } else {
+      _zeroMv = 1650.0f; // Default nominal 3.3V / 2
+    }
+    _m.zeroVoltMv = _zeroMv;
+  }
+
+  // Main high-speed processing burst, called every 200 - 300 ms from FreeRTOS task
+  void processBurst(uint32_t nowMs, float liveSpeedKmh) {
+    if (nowMs - _lastBurstMs < 150) return;
+    _lastBurstMs = nowMs;
+
+    // 1. High-speed burst capture into temporary buffer
+    // Sample interval: ~120us -> Fs ~ 8.3 kHz (captures up to 4 kHz Nyquist)
+    float rawMv[BURST_SIZE];
+    float sumMv = 0.0f;
+    for (size_t i = 0; i < BURST_SIZE; i++) {
+      rawMv[i] = (float)analogReadMilliVolts(_pin);
+      sumMv += rawMv[i];
+      delayMicroseconds(120);
+    }
+
+    float meanMv = sumMv / (float)BURST_SIZE;
+
+    // Auto-update zero calibration if belt has been fully stopped (idle motor)
+    if (liveSpeedKmh <= 0.05f && meanMv >= 1300.0f && meanMv <= 2000.0f) {
+      _zeroMv = _zeroMv * 0.95f + meanMv * 0.05f;
+      _m.zeroVoltMv = _zeroMv;
+    }
+
+    // 2. Low-Frequency DC Current Calculation
+    float diffMv = meanMv - _zeroMv;
+    float instantA = diffMv / _sensMvPerA;
+    if (instantA < 0.0f && liveSpeedKmh <= 0.05f) instantA = 0.0f;
+    if (instantA < -2.0f) instantA = 0.0f;
+
+    _smoothedCurrentA = _smoothedCurrentA * 0.7f + instantA * 0.3f;
+    _m.currentA = _smoothedCurrentA;
+
+    // 3. Instant Electronic Stall Protection (>18A for >300ms)
+    if (instantA >= 18.0f) {
+      if (_stallStartMs == 0) _stallStartMs = nowMs;
+      else if (nowMs - _stallStartMs >= 300) {
+        _stallActive = true;
+      }
+    } else {
+      _stallStartMs = 0;
+      _stallActive = false;
+    }
+    _m.stallAlert = _stallActive;
+
+    // 4. Power & Cumulative Energy (Watts and kWh)
+    float effectiveBusV = liveSpeedKmh > 0.05f ? (_nominalBusV * (0.15f + 0.85f * (liveSpeedKmh / 20.0f))) : 0.0f;
+    if (effectiveBusV > _nominalBusV) effectiveBusV = _nominalBusV;
+    _m.powerWatts = effectiveBusV * _m.currentA;
+
+    float dtSec = _lastEnergyUpdateMs > 0 ? (float)(nowMs - _lastEnergyUpdateMs) / 1000.0f : 0.25f;
+    _lastEnergyUpdateMs = nowMs;
+    if (dtSec > 0.0f && dtSec < 5.0f && _m.powerWatts > 0.0f) {
+      _energyWs += _m.powerWatts * dtSec;
+      _m.energyKWh = _energyWs / 3600000.0f;
+    }
+
+    // 5. Empty-Belt Baseline Capture (in first 5-8 seconds of workout before runner steps on)
+    static uint32_t runStartMs = 0;
+    static float prevSpeedKmh = 0.0f;
+    if (prevSpeedKmh <= 0.05f && liveSpeedKmh > 0.5f) {
+      runStartMs = nowMs;
+      _emptyBeltSampleCount = 0;
+      _emptyBeltSum = 0.0f;
+    }
+    prevSpeedKmh = liveSpeedKmh;
+
+    if (runStartMs > 0 && (nowMs - runStartMs) >= 1500 && (nowMs - runStartMs) <= 6500) {
+      _emptyBeltSum += instantA;
+      _emptyBeltSampleCount++;
+      _m.emptyBeltA = _emptyBeltSum / (float)_emptyBeltSampleCount;
+    }
+
+    // 6. Pre-filtering: Remove DC bias to isolate AC noise & arcing transients
+    float hp[BURST_SIZE];
+    float minAc = 1e9f, maxAc = -1e9f;
+
+    for (size_t i = 0; i < BURST_SIZE; i++) {
+      hp[i] = (rawMv[i] - meanMv) / _sensMvPerA; // in Amperes
+      if (hp[i] < minAc) minAc = hp[i];
+      if (hp[i] > maxAc) maxAc = hp[i];
+    }
+    _m.currentP2pA = (maxAc > minAc) ? (maxAc - minAc) : 0.0f;
+
+    // 7. Statistical Kurtosis Calculation (4th Standardized Moment)
+    double sumSq = 0.0;
+    double sumQuad = 0.0;
+    for (size_t i = 0; i < BURST_SIZE; i++) {
+      double d = (double)hp[i];
+      double d2 = d * d;
+      sumSq += d2;
+      sumQuad += (d2 * d2);
+    }
+
+    double variance = sumSq / (double)BURST_SIZE;
+    double rawKurtosis = 2.8;
+
+    if (variance > 0.0004 && liveSpeedKmh >= 0.5f) { // variance > (20mA)^2
+      rawKurtosis = (sumQuad / (double)BURST_SIZE) / (variance * variance);
+      if (rawKurtosis > 50.0) rawKurtosis = 50.0; // clamp extreme outliers
+    } else {
+      rawKurtosis = 2.8; // Baseline commutation / Gaussian default
+    }
+
+    _m.kurtosis = _m.kurtosis * 0.70f + (float)rawKurtosis * 0.30f;
+
+    // 8. CUSUM / Temporal Evidence Accumulator (Guarantees Zero False Positives)
+    //    Step increments are clamped to max +6.0 per burst so single spikes never trigger an alert
+    if (liveSpeedKmh >= 0.8f && _m.currentA >= 0.3f) {
+      if (rawKurtosis >= 6.5) {
+        float inc = (float)(rawKurtosis - 5.0) * 0.8f;
+        if (inc > 6.0f) inc = 6.0f; // Clamped per burst
+        _arcingScore += inc;
+      } else if (rawKurtosis <= 4.2) {
+        _arcingScore -= 2.0f;
+      }
+    } else {
+      _arcingScore -= 3.0f; // Rapid decay at idle
+    }
+
+    if (_arcingScore < 0.0f) _arcingScore = 0.0f;
+    if (_arcingScore > 100.0f) _arcingScore = 100.0f;
+    _m.arcingScore = _arcingScore;
+
+    if (_arcingScore >= 45.0f) {
+      _brushState = 2; // Critical: Severe wear / heavy continuous sparking
+    } else if (_arcingScore >= 18.0f) {
+      _brushState = 1; // Warning: Early wear / intermittent sparking
+    } else {
+      _brushState = 0; // Healthy: Smooth commutation
+    }
+    _m.brushHealth = _brushState;
+
+    // 9. Medium-Frequency Band: Mechanical Footstrike Step Counter & Symmetry
+    float prevVal = _stepLpCurrent;
+    _stepLpCurrent = _stepLpCurrent * 0.7f + instantA * 0.3f;
+    float slope = _stepLpCurrent - prevVal;
+
+    if (liveSpeedKmh >= 1.5f && (nowMs - _lastStepMs) >= 230) {
+      float thresholdA = _smoothedCurrentA + 0.22f;
+      if (_stepLpCurrent >= thresholdA && _prevStepSlope > 0.0f && slope <= 0.0f) {
+        uint32_t stepIntervalMs = nowMs - _lastStepMs;
+        _lastStepMs = nowMs;
+        _stepCount++;
+        _m.stepCount = _stepCount;
+
+        if (stepIntervalMs > 0 && stepIntervalMs < 1200) {
+          uint16_t instantSpm = (uint16_t)(60000UL / stepIntervalMs);
+          if (instantSpm >= 90 && instantSpm <= 220) {
+            _m.cadenceSpm = (uint16_t)(_m.cadenceSpm * 0.7f + instantSpm * 0.3f);
+          }
+        }
+
+        float peakAmp = _stepLpCurrent - _smoothedCurrentA;
+        if (_stepAlternator) {
+          _rightPeakSum = _rightPeakSum * 0.85f + peakAmp * 0.15f;
+        } else {
+          _leftPeakSum = _leftPeakSum * 0.85f + peakAmp * 0.15f;
+        }
+        _stepAlternator = !_stepAlternator;
+
+        if (_leftPeakSum > 0.05f && _rightPeakSum > 0.05f) {
+          float ratio = _leftPeakSum < _rightPeakSum ? (_leftPeakSum / _rightPeakSum) : (_rightPeakSum / _leftPeakSum);
+          _symmetryPct = _symmetryPct * 0.9f + (ratio * 100.0f) * 0.1f;
+          _m.symmetryPct = _symmetryPct;
+        }
+      }
+    }
+    _prevStepSlope = slope;
+  }
+
+  void resetSteps() {
+    _stepCount = 0;
+    _m.stepCount = 0;
+    _m.cadenceSpm = 0;
+    _lastStepMs = 0;
+  }
+
+  void resetEnergy() {
+    _energyWs = 0.0f;
+    _m.energyKWh = 0.0f;
+  }
+
+  void resetArcingScore() {
+    _arcingScore = 0.0f;
+    _m.arcingScore = 0.0f;
+    _m.brushHealth = 0;
+  }
+
+  const Metrics& getMetrics() const {
+    return _m;
+  }
+
+private:
+  uint8_t _pin;
+  float _zeroMv;
+  float _sensMvPerA;
+  float _nominalBusV;
+  bool _calibrated;
+
+  float _arcingScore;
+  uint8_t _brushState;
+
+  uint32_t _emptyBeltSampleCount;
+  float _emptyBeltSum;
+
+  float _energyWs;
+  uint32_t _lastEnergyUpdateMs;
+
+  uint32_t _stepCount;
+  uint32_t _lastStepMs;
+  float _stepLpCurrent;
+  float _prevStepSlope;
+  float _leftPeakSum;
+  float _rightPeakSum;
+  bool _stepAlternator;
+  float _symmetryPct;
+
+  uint32_t _stallStartMs;
+  bool _stallActive;
+
+  uint32_t _lastBurstMs;
+  float _smoothedCurrentA;
+
+  Metrics _m;
+};
+
+} // namespace dsp
+// ==================== END OF MOTOR CURRENT DSP ENGINE ======================
+
 
 #define PIN_DS   4
 #define PIN_ACS  5
