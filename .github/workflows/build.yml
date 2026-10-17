@@ -22,7 +22,9 @@ jobs:
           F=$(git log -1 --name-only --diff-filter=AM --format= -- '*.ino' | head -1)
           echo "Using sketch: $F"
           cp "$F" sketch/kettler_temp/kettler_temp.ino
-          cp MotorHealth.h sketch/kettler_temp/
+          cp MotorHealth.h sketch/kettler_temp/ 2>/dev/null || true
+          cp MotorCurrentDSP.h sketch/kettler_temp/ 2>/dev/null || true
+          cp *.h sketch/kettler_temp/ 2>/dev/null || true
           arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB,FlashMode=qio --output-dir out sketch/kettler_temp
       - name: Collect firmware
         run: |
