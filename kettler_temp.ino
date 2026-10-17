@@ -1029,7 +1029,7 @@ void setup() {
   adv->start();
 
   dspEngine.begin(PIN_ACS, 180.0f, 26.4f);
-  xTaskCreatePinnedToCore(dspTask, "dspTask", 4096, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(dspTask, "dspTask", 8192, nullptr, 1, nullptr, 1);
   xTaskCreate(guardTask, "guard", 8192, nullptr, 1, nullptr);
 }
 
