@@ -229,7 +229,7 @@ public:
 
     // 4. Power & Cumulative Energy (Watts and kWh)
     float effectiveBusV = liveSpeedKmh > 0.05f ? (_cfg.nominalBusV * (0.15f + 0.85f * (liveSpeedKmh / 20.0f))) : 0.0f;
-    if (effectiveBusV > _cfg.nominalBusV) effectiveBusV = _nominalBusV;
+    if (effectiveBusV > _cfg.nominalBusV) effectiveBusV = _cfg.nominalBusV;
     _m.powerWatts = effectiveBusV * _m.currentA;
 
     float dtSec = _lastEnergyUpdateMs > 0 ? (float)(nowMs - _lastEnergyUpdateMs) / 1000.0f : 0.25f;
