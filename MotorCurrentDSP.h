@@ -3,33 +3,19 @@
 #include <math.h>
 
 /**
- * MotorCurrentDSP.h - Industrial-Grade Multi-Band Digital Signal Processing (DSP) Engine (v13)
- * Designed for ESP32-S3 + Allegro ACS758LCB-050B (50A Bi-directional Hall-Effect Current Sensor)
- * Tailored for Kettler Dortmund S2 DC Treadmill Motor:
- *   - Continuous Rating: 180 VDC, 10.0 A (Continuous Duty CON), 2.5 HP, 4600 RPM, Class F
- *   - Stall Current Protection: >15.0 A (150% FLA) sustained for >300 ms
+ * MotorCurrentDSP.h - High-Speed Multi-Band Digital Signal Processing (DSP) Engine
+ * Designed for ESP32-S3 + Allegro ACS758LCB-050B (50A Hall-Effect Current Sensor)
  *
- * v13 Physical & Mechanical Realism Enhancements:
- * 1. Auto-Ratiometric Sensitivity Scaling:
- *    - Automatically calculates exact mV/A sensitivity based on actual measured zero-point voltage:
- *      Sensitivity = 40.0 * (2 * V_zero / 5000)
- *      (e.g., 1500mV zero -> 24.0 mV/A; 1650mV zero -> 26.4 mV/A). Fully toggleable and overrideable!
- * 2. Inertia Start Delay & Acceleration Elimination:
- *    - Configurable delay (default 3.5s, range 1.0 - 10.0s) before capturing empty belt baseline,
- *      ensuring start beeps and roller inertia torque are completely bypassed.
- * 3. Incline Load Current Compensation:
- *    - Accounts for gravitational torque increase during inclined workouts (default 0.15 A/% grade),
- *      allowing clean motor load and belt friction estimation across all deck inclines.
- * 4. Dynamic Thermal Zero Tracking:
- *    - Slow adaptation at idle (liveSpeed <= 0.05 km/h) to track Hall sensor and ADC thermal drift.
- *      Fully toggleable from the Web App!
- * 5. Unidirectional Diode Clamping:
- *    - Enforces physical forward-only DC drive; clamps inductive PWM negative flyback transients to 0.0A.
- * 6. Smart Power Fallback:
- *    - Computes realistic effective armature voltage even if speed telemetry is pending or testing on bench.
- *
- * NOTE: Buffers _rawMv and _hp are allocated as class member variables (in SRAM .bss)
- * to prevent FreeRTOS task stack overflow and ensure rock-solid Bluetooth stability.
+ * Implements:
+ * 1. High-Speed Burst Sampling & ADC eFuse Millivolt Reading on GPIO 5 (ADC1)
+ * 2. Pre-processing: Zero-Current Tracking & Fast DC-Removal High-Pass Filtering
+ * 3. PWM Carrier Notch / Bandstop Suppression to eliminate false arcing detection
+ * 4. 4th Standardized Moment (Sample Kurtosis) Engine for Brush Arcing/Wear Detection
+ * 5. Temporal CUSUM Evidence Accumulator for Zero-False-Alarm Confidence Scoring
+ * 6. Low-Frequency Path: Instant Electronic Stall Protection (>15A), Power (Watts/kWh),
+ *    and Empty-Belt Baseline Friction Monitoring for Lubrication Tracking
+ * 7. Medium-Frequency Path: Mechanical Footstrike Step Counter (Schmitt Trigger + Runner Gate)
+ * 8. Dynamic Body Weight Estimator from Armature Drag & Impact Force
  */
 
 namespace dsp {
@@ -101,7 +87,7 @@ public:
     c.cusumWarnScore        = 18.0f;             // Score >= 18.0 -> Warning
     c.cusumCritScore        = 45.0f;             // Score >= 45.0 -> Critical
     c.emptyBeltWarnA        = 3.5f;              // Empty belt > 3.5A -> Needs silicone lubrication
-    c.stepDeltaA            = 0.18f;             // Sensitive footstrike load pulse (0.18A)
+    c.stepDeltaA            = 0.25f;             // Sensitive footstrike load pulse (0.18A)
     c.sensMvPerA            = DEFAULT_SENS_MV_A; // 26.4 mV/A
     c.nominalBusV           = RATED_BUS_VOLTS;   // 180.0 V
     c.calibratedBaselineA   = 1.80f;             // Clean pristine baseline after lubrication
@@ -121,7 +107,7 @@ public:
       _stepCount(0), _lastStepMs(0),
       _stepLpCurrent(0.0f), _prevStepSlope(0.0f),
       _leftPeakSum(0.0f), _rightPeakSum(0.0f),
-      _stepAlternator(false), _symmetryPct(100.0f), _stepArmed(true), _estWeight(75.0f),
+      _stepAlternator(false), _symmetryPct(100.0f), _stepArmed(true),
       _stallStartMs(0), _stallActive(false),
       _lastBurstMs(0), _smoothedCurrentA(0.0f),
       _estWeight(0.0f)
@@ -386,61 +372,98 @@ public:
     }
     _m.brushHealth = _brushState;
 
-    // 9. Medium-Frequency Band: Mechanical Footstrike Step Counter & Symmetry
+    // 9. Medium-Frequency Band: Mechanical Footstrike Step Counter (Schmitt Trigger + Trough Tracker)
     static float _stepBaseA = 0.0f;
     if (_stepBaseA < 0.1f) _stepBaseA = instantA;
-    _stepBaseA = _stepBaseA * 0.96f + instantA * 0.04f; // Slow running baseline DC load
+    
+    // متتبع قاع الخطوة (Trough Tracker): يتبع الهبوط بسرعة، والصعود ببطء شديد
+    if (instantA < _stepBaseA) {
+      _stepBaseA = _stepBaseA * 0.85f + instantA * 0.15f;
+    } else {
+      _stepBaseA = _stepBaseA * 0.992f + instantA * 0.008f;
+    }
 
-    float prevVal = _stepLpCurrent;
-    _stepLpCurrent = _stepLpCurrent * 0.4f + instantA * 0.6f; // Fast footstrike impact pulse
-    float slope = _stepLpCurrent - prevVal;
+    // متتبع نبضة ضربة القدم السريعة (Fast Impact Pulse Follower)
+    _stepLpCurrent = _stepLpCurrent * 0.35f + instantA * 0.65f;
 
-    // Trigger step if speed is streamed (>=1.0 km/h) OR motor is loaded under runner body weight (>=0.8A)
-    if ((liveSpeedKmh >= 1.0f || _smoothedCurrentA >= 0.8f) && (nowMs - _lastStepMs) >= 220) {
-      float thresholdA = _stepBaseA + _cfg.stepDeltaA;
-      if (_stepLpCurrent >= thresholdA && _prevStepSlope > 0.0f && slope <= 0.0f) {
-        uint32_t stepIntervalMs = nowMs - _lastStepMs;
-        _lastStepMs = nowMs;
-        _stepCount++;
-        _m.stepCount = _stepCount;
+    // مرجع تيار السير الفارغ
+    float emptyRef = _m.emptyBeltA > 0.5f ? _m.emptyBeltA : 0.95f;
 
-        if (stepIntervalMs > 0 && stepIntervalMs < 1200) {
-          uint16_t instantSpm = (uint16_t)(60000UL / stepIntervalMs);
-          if (instantSpm >= 90 && instantSpm <= 220) {
-            _m.cadenceSpm = (uint16_t)(_m.cadenceSpm * 0.7f + instantSpm * 0.3f);
+    // بوابة وجود الراكب (Runner Presence Lock Gate):
+    // التيار وهو فارغ 0.8A-1.0A، ومع الراكب يقفز إلى 2.3A (+1.4A).
+    // يُقفل عداد الخطوات تماماً إذا كان السير فارغاً لمنع أي عد كاذب ناتج عن تموجات السير الفارغ
+    bool runnerOnBelt = (_smoothedCurrentA >= (emptyRef + 0.35f)) || (_smoothedCurrentA >= 1.35f);
+
+    // عتبة نبضة الخطوة الديناميكية (0.25A كافية لتجاوز تموجات السير وتلتقط نبضة ضربة القدم 0.4-0.8A)
+    float stepDelta = (_cfg.stepDeltaA >= 0.15f && _cfg.stepDeltaA <= 0.45f) ? _cfg.stepDeltaA : 0.25f;
+    float stepThreshold = _stepBaseA + stepDelta;
+    float resetThreshold = _stepBaseA + (stepDelta * 0.30f);
+
+    uint32_t dtStep = nowMs - _lastStepMs;
+
+    if (runnerOnBelt) {
+      if (!_stepArmed) {
+        if (_stepLpCurrent < resetThreshold && dtStep >= 230) {
+          _stepArmed = true; // إعادة تفعيل الحساسية للخطوة التالية
+        }
+      } else {
+        if (_stepLpCurrent >= stepThreshold && dtStep >= 230) {
+          _stepArmed = false; // تسجيل الخطوة فور تجاوز عتبة الصدمة الميكانيكية
+          _stepCount++;
+          _m.stepCount = _stepCount;
+          _lastStepMs = nowMs;
+
+          // حساب سرعة الخطوات الحية بدقة (Cadence SPM)
+          if (dtStep > 230 && dtStep < 1400) {
+            uint16_t instantSpm = (uint16_t)(60000UL / dtStep);
+            if (instantSpm >= 75 && instantSpm <= 220) {
+              _m.cadenceSpm = _m.cadenceSpm == 0 ? instantSpm : (uint16_t)(_m.cadenceSpm * 0.65f + instantSpm * 0.35f);
+            }
           }
-        }
 
-        float peakAmp = _stepLpCurrent - _smoothedCurrentA;
-        if (_stepAlternator) {
-          _rightPeakSum = _rightPeakSum * 0.85f + peakAmp * 0.15f;
-        } else {
-          _leftPeakSum = _leftPeakSum * 0.85f + peakAmp * 0.15f;
-        }
-        _stepAlternator = !_stepAlternator;
+          // سعة نبضة الصدمة لحساب الوزن وتناسق الساقين
+          float peakAmp = _stepLpCurrent - _stepBaseA;
+          if (peakAmp > 0.05f) {
+            if (_stepAlternator) {
+              _rightPeakSum = _rightPeakSum * 0.80f + peakAmp * 0.20f;
+            } else {
+              _leftPeakSum = _leftPeakSum * 0.80f + peakAmp * 0.20f;
+            }
+            _stepAlternator = !_stepAlternator;
+          }
 
-        if (_leftPeakSum > 0.05f && _rightPeakSum > 0.05f) {
-          float ratio = _leftPeakSum < _rightPeakSum ? (_leftPeakSum / _rightPeakSum) : (_rightPeakSum / _leftPeakSum);
-          _symmetryPct = _symmetryPct * 0.9f + (ratio * 100.0f) * 0.1f;
-          _m.symmetryPct = _symmetryPct;
+          // تناسق الساقين
+          if (_leftPeakSum > 0.05f && _rightPeakSum > 0.05f) {
+            float ratio = _leftPeakSum < _rightPeakSum ? (_leftPeakSum / _rightPeakSum) : (_rightPeakSum / _leftPeakSum);
+            _symmetryPct = _symmetryPct * 0.85f + (ratio * 100.0f) * 0.15f;
+            _m.symmetryPct = _symmetryPct;
 
-          if (_m.symmetryPct < 70.0f) _m.fatigueState = 2;       // High Fatigue
-          else if (_m.symmetryPct < 85.0f) _m.fatigueState = 1;  // Moderate Fatigue
-          else _m.fatigueState = 0;                              // Fresh
-        }
-
-        // Dynamic Weight Estimation: Peak impact current proportional to body mass
-        float avgPeak = (_leftPeakSum + _rightPeakSum) * 0.5f;
-        if (avgPeak > 0.15f && liveSpeedKmh > 3.0f) {
-          float estKg = (avgPeak * 55.0f) / (1.0f + 0.03f * liveSpeedKmh);
-          if (estKg >= 40.0f && estKg <= 150.0f) {
-            _estWeight = _estWeight > 0.0f ? (_estWeight * 0.95f + estKg * 0.05f) : estKg;
-            _m.estimatedWeightKg = _estWeight;
+            if (_m.symmetryPct < 70.0f) _m.fatigueState = 2;
+            else if (_m.symmetryPct < 85.0f) _m.fatigueState = 1;
+            else _m.fatigueState = 0;
           }
         }
       }
+
+      // 10. التقدير الديناميكي للوزن (Dynamic Weight Estimation)
+      // يعتمد على الحمل الكهربائي الإضافي الذي يسببه وزن الراكب فوق تيار السير الفارغ
+      float emptyRef = _m.emptyBeltA > 0.5f ? _m.emptyBeltA : 0.95f;
+      float loadDeltaA = _smoothedCurrentA - emptyRef;
+      if (loadDeltaA > 0.35f) {
+        float weightFromDrag = loadDeltaA * 54.0f;
+        float avgPeak = (_leftPeakSum + _rightPeakSum) * 0.5f;
+        float weightFromPeak = (avgPeak > 0.08f) ? (avgPeak * 115.0f) : weightFromDrag;
+        float rawEstKg = (avgPeak > 0.08f) ? (weightFromDrag * 0.55f + weightFromPeak * 0.45f) : weightFromDrag;
+
+        if (rawEstKg >= 40.0f && rawEstKg <= 150.0f) {
+          if (_estWeight < 35.0f) _estWeight = rawEstKg;
+          else _estWeight = _estWeight * 0.96f + rawEstKg * 0.04f;
+          _m.estimatedWeightKg = _estWeight;
+        }
+      }
+    } else {
+      _stepArmed = true;
     }
-    _prevStepSlope = slope;
 
     // Step-Off / Unloaded Belt Detector: belt running fast but current near empty belt
     if (liveSpeedKmh >= 3.0f && _m.emptyBeltA > 0.5f) {
@@ -552,7 +575,6 @@ private:
   bool _stepAlternator;
   float _symmetryPct;
   bool _stepArmed;
-  float _estWeight;
 
   uint32_t _stallStartMs;
   bool _stallActive;
