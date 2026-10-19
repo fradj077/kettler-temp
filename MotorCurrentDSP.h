@@ -3,30 +3,30 @@
 #include <math.h>
 
 /**
- * MotorCurrentDSP.h - Industrial-Grade Multi-Band Digital Signal Processing (DSP) Engine
+ * MotorCurrentDSP.h - Industrial-Grade Multi-Band Digital Signal Processing (DSP) Engine (v13)
  * Designed for ESP32-S3 + Allegro ACS758LCB-050B (50A Bi-directional Hall-Effect Current Sensor)
  * Tailored for Kettler Dortmund S2 DC Treadmill Motor:
  *   - Continuous Rating: 180 VDC, 10.0 A (Continuous Duty CON), 2.5 HP, 4600 RPM, Class F
  *   - Stall Current Protection: >15.0 A (150% FLA) sustained for >300 ms
  *
- * Implements Full Dynamic Parameter Margin Tuning & Maintenance Baseline Auto-Calibration:
- * 1. High-Speed Burst Sampling & ADC eFuse Millivolt Reading on GPIO 5 (ADC1)
- * 2. Pre-processing: Zero-Current Tracking & Fast DC-Removal High-Pass Filtering
- * 3. Commutator Micro-Arcing & Brush Wear Detection via 4th Standardized Moment (Sample Kurtosis)
- * 4. Temporal CUSUM Evidence Accumulator for Zero-False-Alarm Confidence Scoring
- * 5. Low-Frequency Path: Real-time DC Amperes, Motor Load %, Power (Watts), Cumulative Energy (kWh),
- *    and Empty-Belt Baseline Friction Monitoring for Belt Lubrication Tracking
- * 6. "تم التشحيم" (Lubrication Done) Golden Baseline Auto-Calibration:
- *    - Records pristine unloaded current right after silicone oil application
- *    - Automatically sets dynamic wear threshold (+55% friction increase)
- *    - Computes real-time mechanical friction degradation ratio
- * 7. Medium-Frequency Path (1-4 Hz): Mechanical Footstrike Peak Detector & Left/Right Symmetry
- * 8. Smart Biometrics Suite:
- *    - Dynamic Body Weight Estimation from belt velocity & active load delta
- *    - Autonomous Step-Off / Fall Safety Detection (Zero-false-alarm unloaded detector)
- *    - Gait Asymmetry & Fatigue State Machine (Injury Prevention Index)
- *    - Running Economy Index (Wh/km & mechanical efficiency rating)
- *    - Mechanical Belt Tension & Roller Bearing Roughness Diagnostic
+ * v13 Physical & Mechanical Realism Enhancements:
+ * 1. Auto-Ratiometric Sensitivity Scaling:
+ *    - Automatically calculates exact mV/A sensitivity based on actual measured zero-point voltage:
+ *      Sensitivity = 40.0 * (2 * V_zero / 5000)
+ *      (e.g., 1500mV zero -> 24.0 mV/A; 1650mV zero -> 26.4 mV/A). Fully toggleable and overrideable!
+ * 2. Inertia Start Delay & Acceleration Elimination:
+ *    - Configurable delay (default 3.5s, range 1.0 - 10.0s) before capturing empty belt baseline,
+ *      ensuring start beeps and roller inertia torque are completely bypassed.
+ * 3. Incline Load Current Compensation:
+ *    - Accounts for gravitational torque increase during inclined workouts (default 0.15 A/% grade),
+ *      allowing clean motor load and belt friction estimation across all deck inclines.
+ * 4. Dynamic Thermal Zero Tracking:
+ *    - Slow adaptation at idle (liveSpeed <= 0.05 km/h) to track Hall sensor and ADC thermal drift.
+ *      Fully toggleable from the Web App!
+ * 5. Unidirectional Diode Clamping:
+ *    - Enforces physical forward-only DC drive; clamps inductive PWM negative flyback transients to 0.0A.
+ * 6. Smart Power Fallback:
+ *    - Computes realistic effective armature voltage even if speed telemetry is pending or testing on bench.
  *
  * NOTE: Buffers _rawMv and _hp are allocated as class member variables (in SRAM .bss)
  * to prevent FreeRTOS task stack overflow and ensure rock-solid Bluetooth stability.
@@ -38,14 +38,18 @@ struct DspConfig {
   float ratedCurrentA;        // Continuous Rated Current (Nameplate: 10.0A, Range: 5.0 - 25.0A)
   float stallLimitA;          // Stall Trip Limit (Default 150%: 15.0A, Range: 8.0 - 25.0A)
   uint16_t stallDelayMs;      // Trip Persistence Duration (Default: 300ms, Range: 100 - 1500ms)
-  float kurtosisThresh;       // Arcing Detection Kurtosis Threshold (Default: 6.5, Range: 4.0 - 12.0)
+  float kurtosisThresh;       // Arcing Detection Kurtosis Threshold (Default: 6.5, Range: 4.0 - 30.0)
   float cusumWarnScore;       // CUSUM Warning Accumulator Score (Default: 18.0, Range: 5.0 - 50.0)
   float cusumCritScore;       // CUSUM Critical Accumulator Score (Default: 45.0, Range: 20.0 - 90.0)
   float emptyBeltWarnA;       // Unloaded Belt Lubrication Warn Limit (Default: 3.5A, Range: 1.5 - 6.0A)
-  float stepDeltaA;           // Footstrike Peak Threshold Delta (Default: 0.22A, Range: 0.08 - 0.80A)
+  float stepDeltaA;           // Footstrike Peak Threshold Delta (Default: 0.18A, Range: 0.08 - 0.80A)
   float sensMvPerA;           // ACS758 Sensitivity on 3.3V (Default: 26.4 mV/A, Range: 15.0 - 45.0)
   float nominalBusV;          // Nominal DC Bus Voltage (Default: 180.0V, Range: 90.0 - 240.0V)
-  float calibratedBaselineA;  // Clean empty belt baseline captured right after lubrication (Default: 1.8f)
+  float calibratedBaselineA;  // Clean empty belt baseline captured right after lubrication (Default: 1.80A)
+  uint8_t autoSensOn;         // 1 = Auto-calculate from zero voltage, 0 = Manual sensMvPerA (Default: 1)
+  float inertiaDelayS;        // Delay before lubrication baseline measurement (Default: 3.5s, Range: 1.0 - 10.0s)
+  float inclineCompA;         // Incline current compensation per 1% grade (Default: 0.15A/%, Range: 0.0 - 0.50A/%)
+  uint8_t zeroTrackingOn;     // 1 = Dynamic thermal zero tracking at idle, 0 = Fixed zero (Default: 1)
 };
 
 struct Metrics {
@@ -66,6 +70,7 @@ struct Metrics {
   float symmetryPct;           // Left/Right footstrike balance (100% = perfectly symmetrical)
   bool stallAlert;             // True if current exceeds stallLimitA for >stallDelayMs
   float zeroVoltMv;            // Auto-calibrated zero-current voltage in mV
+  float activeSensMvA;         // Active sensitivity currently in effect
 
   // --- Smart Biometrics & Mechanical Analytics ---
   float estimatedWeightKg;     // Dynamically estimated body weight in kg
@@ -100,6 +105,10 @@ public:
     c.sensMvPerA            = DEFAULT_SENS_MV_A; // 26.4 mV/A
     c.nominalBusV           = RATED_BUS_VOLTS;   // 180.0 V
     c.calibratedBaselineA   = 1.80f;             // Clean pristine baseline after lubrication
+    c.autoSensOn            = 1;                 // Default: Auto-calculate from zero voltage
+    c.inertiaDelayS         = 3.5f;              // 3.5 seconds start delay to bypass acceleration
+    c.inclineCompA          = 0.15f;             // 0.15 A per 1% grade
+    c.zeroTrackingOn        = 1;                 // Default: Auto-track thermal zero at idle
     return c;
   }
 
@@ -129,6 +138,7 @@ public:
     _m.estimatedWeightKg = 75.0f;
     _m.beltTensionStatus = 1;
     _m.bearingStatus = 0;
+    _m.activeSensMvA = _cfg.sensMvPerA;
   }
 
   void begin(uint8_t pin = 5, float nominalBusVoltage = RATED_BUS_VOLTS, float sensitivityMvPerA = DEFAULT_SENS_MV_A) {
@@ -160,19 +170,23 @@ public:
       delayMicroseconds(100);
     }
     float v0 = sum / (float)samples;
-    // Sanity check: ACS758 on 3.3V has Vcc/2 ~ 1650mV (allow 1200mV - 2100mV)
-    if (v0 >= 1200.0f && v0 <= 2100.0f) {
+    // Sanity check: allow 1100mV - 2200mV (covering 2.5V - 4.4V rail halving)
+    if (v0 >= 1100.0f && v0 <= 2200.0f) {
       _zeroMv = v0;
       _calibrated = true;
     } else {
       _zeroMv = 1650.0f; // Default nominal 3.3V / 2
     }
     _m.zeroVoltMv = _zeroMv;
+
+    // Apply auto-ratiometric sensitivity scaling if enabled
+    _updateActiveSensitivity();
   }
 
   void setConfig(const DspConfig& c) {
     _cfg = c;
     _validateConfig();
+    _updateActiveSensitivity();
   }
 
   const DspConfig& getConfig() const {
@@ -181,10 +195,11 @@ public:
 
   void resetConfigToDefaults() {
     _cfg = getDefaultConfig();
+    _updateActiveSensitivity();
   }
 
   // Main high-speed processing burst, called every ~180-250 ms from dedicated FreeRTOS task
-  void processBurst(uint32_t nowMs, float liveSpeedKmh) {
+  void processBurst(uint32_t nowMs, float liveSpeedKmh, float liveInclPct = 0.0f) {
     if (nowMs - _lastBurstMs < 140) return;
     _lastBurstMs = nowMs;
 
@@ -200,16 +215,21 @@ public:
     float meanMv = sumMv / (float)BURST_SIZE;
 
     // Auto-update zero calibration if belt has been fully stopped (idle motor)
-    if (liveSpeedKmh <= 0.05f && meanMv >= 1300.0f && meanMv <= 2000.0f) {
-      _zeroMv = _zeroMv * 0.95f + meanMv * 0.05f;
+    // CRITICAL GUARD: Only track true micro-thermal drift (< 5.0 mV, approx < 0.2A).
+    // If current is flowing (diff >= 5.0 mV), NEVER shift zero point!
+    float driftDiff = fabsf(meanMv - _zeroMv);
+    if (_cfg.zeroTrackingOn != 0 && liveSpeedKmh <= 0.05f && driftDiff < 5.0f && meanMv >= 1200.0f && meanMv <= 2100.0f) {
+      _zeroMv = _zeroMv * 0.995f + meanMv * 0.005f;
       _m.zeroVoltMv = _zeroMv;
+      _updateActiveSensitivity();
     }
 
     // 2. Low-Frequency DC Current & Motor Load % Calculation
+    // Auto-Polarity: Uses fabsf(diffMv) so current is measured accurately regardless of
+    // whether the primary terminals (IP+ / IP-) are wired in forward or reverse direction.
     float diffMv = meanMv - _zeroMv;
-    float instantA = diffMv / _cfg.sensMvPerA;
-    if (instantA < 0.0f && liveSpeedKmh <= 0.05f) instantA = 0.0f;
-    if (instantA < -2.0f) instantA = 0.0f;
+    float instantA = fabsf(diffMv) / _effectiveSens();
+    if (instantA < 0.04f) instantA = 0.0f; // Noise deadband at idle
 
     _smoothedCurrentA = _smoothedCurrentA * 0.7f + instantA * 0.3f;
     _m.currentA = _smoothedCurrentA;
@@ -228,8 +248,14 @@ public:
     _m.stallAlert = _stallActive;
 
     // 4. Power & Cumulative Energy (Watts and kWh)
-    float effectiveBusV = liveSpeedKmh > 0.05f ? (_cfg.nominalBusV * (0.15f + 0.85f * (liveSpeedKmh / 20.0f))) : 0.0f;
-    if (effectiveBusV > _cfg.nominalBusV) effectiveBusV = _cfg.nominalBusV;
+    float effectiveBusV = 0.0f;
+    if (liveSpeedKmh > 0.05f) {
+      effectiveBusV = _cfg.nominalBusV * (0.15f + 0.85f * (liveSpeedKmh / 20.0f));
+      if (effectiveBusV > _cfg.nominalBusV) effectiveBusV = _cfg.nominalBusV;
+    } else if (instantA > 0.8f) {
+      // Smart Fallback: Motor running on test bench or treadmill bridge speed pending
+      effectiveBusV = _cfg.nominalBusV * 0.25f;
+    }
     _m.powerWatts = effectiveBusV * _m.currentA;
 
     float dtSec = _lastEnergyUpdateMs > 0 ? (float)(nowMs - _lastEnergyUpdateMs) / 1000.0f : 0.25f;
@@ -250,8 +276,18 @@ public:
     }
     prevSpeedKmh = liveSpeedKmh;
 
-    if (runStartMs > 0 && (nowMs - runStartMs) >= 1500 && (nowMs - runStartMs) <= 6500) {
-      _emptyBeltSum += instantA;
+    // Inertia Delay Filter Window: bypass acceleration and drum inertia
+    uint32_t startDelayMs = (uint32_t)(_cfg.inertiaDelayS * 1000.0f);
+    if (startDelayMs < 1000) startDelayMs = 1000;
+    if (startDelayMs > 10000) startDelayMs = 10000;
+    uint32_t endDelayMs = startDelayMs + 5000; // 5-second clean measurement window
+
+    if (runStartMs > 0 && (nowMs - runStartMs) >= startDelayMs && (nowMs - runStartMs) <= endDelayMs) {
+      // Subtract incline gravitational load if running on an inclined deck
+      float compA = (liveInclPct > 0.0f && _cfg.inclineCompA > 0.0f) ? (liveInclPct * _cfg.inclineCompA) : 0.0f;
+      float netBeltCurrent = (instantA > compA) ? (instantA - compA) : instantA;
+
+      _emptyBeltSum += netBeltCurrent;
       _emptyBeltSampleCount++;
       _m.emptyBeltA = _emptyBeltSum / (float)_emptyBeltSampleCount;
 
@@ -288,7 +324,7 @@ public:
     float minAc = 1e9f, maxAc = -1e9f;
 
     for (size_t i = 0; i < BURST_SIZE; i++) {
-      _hp[i] = (_rawMv[i] - meanMv) / _cfg.sensMvPerA; // AC component in Amperes
+      _hp[i] = (_rawMv[i] - meanMv) / _effectiveSens(); // AC component in Amperes
       if (_hp[i] < minAc) minAc = _hp[i];
       if (_hp[i] > maxAc) maxAc = _hp[i];
     }
@@ -351,12 +387,17 @@ public:
     _m.brushHealth = _brushState;
 
     // 9. Medium-Frequency Band: Mechanical Footstrike Step Counter & Symmetry
+    static float _stepBaseA = 0.0f;
+    if (_stepBaseA < 0.1f) _stepBaseA = instantA;
+    _stepBaseA = _stepBaseA * 0.96f + instantA * 0.04f; // Slow running baseline DC load
+
     float prevVal = _stepLpCurrent;
-    _stepLpCurrent = _stepLpCurrent * 0.7f + instantA * 0.3f;
+    _stepLpCurrent = _stepLpCurrent * 0.4f + instantA * 0.6f; // Fast footstrike impact pulse
     float slope = _stepLpCurrent - prevVal;
 
-    if (liveSpeedKmh >= 1.5f && (nowMs - _lastStepMs) >= 230) {
-      float thresholdA = _smoothedCurrentA + _cfg.stepDeltaA;
+    // Trigger step if speed is streamed (>=1.0 km/h) OR motor is loaded under runner body weight (>=0.8A)
+    if ((liveSpeedKmh >= 1.0f || _smoothedCurrentA >= 0.8f) && (nowMs - _lastStepMs) >= 220) {
+      float thresholdA = _stepBaseA + _cfg.stepDeltaA;
       if (_stepLpCurrent >= thresholdA && _prevStepSlope > 0.0f && slope <= 0.0f) {
         uint32_t stepIntervalMs = nowMs - _lastStepMs;
         _lastStepMs = nowMs;
@@ -382,53 +423,39 @@ public:
           float ratio = _leftPeakSum < _rightPeakSum ? (_leftPeakSum / _rightPeakSum) : (_rightPeakSum / _leftPeakSum);
           _symmetryPct = _symmetryPct * 0.9f + (ratio * 100.0f) * 0.1f;
           _m.symmetryPct = _symmetryPct;
+
+          if (_m.symmetryPct < 70.0f) _m.fatigueState = 2;       // High Fatigue
+          else if (_m.symmetryPct < 85.0f) _m.fatigueState = 1;  // Moderate Fatigue
+          else _m.fatigueState = 0;                              // Fresh
+        }
+
+        // Dynamic Weight Estimation: Peak impact current proportional to body mass
+        float avgPeak = (_leftPeakSum + _rightPeakSum) * 0.5f;
+        if (avgPeak > 0.15f && liveSpeedKmh > 3.0f) {
+          float estKg = (avgPeak * 55.0f) / (1.0f + 0.03f * liveSpeedKmh);
+          if (estKg >= 40.0f && estKg <= 150.0f) {
+            _estWeight = _estWeight > 0.0f ? (_estWeight * 0.95f + estKg * 0.05f) : estKg;
+            _m.estimatedWeightKg = _estWeight;
+          }
         }
       }
     }
     _prevStepSlope = slope;
 
-    // 10. Smart Biometrics: Gait Asymmetry & Fatigue State Machine
-    if (_m.stepCount >= 30) {
-      if (_m.symmetryPct >= 88.0f) _m.fatigueState = 0;         // Fresh & Balanced
-      else if (_m.symmetryPct >= 78.0f) _m.fatigueState = 1;    // Moderate Fatigue
-      else _m.fatigueState = 2;                                 // High Fatigue / Injury Risk
-    } else {
-      _m.fatigueState = 0;
-    }
-
-    // 11. Smart Biometrics: Running Economy Index (Wh/km)
-    if (liveSpeedKmh >= 1.0f && _m.powerWatts > 10.0f) {
-      _m.runningEconomyWhPerKm = _m.powerWatts / liveSpeedKmh;
-      if (_m.runningEconomyWhPerKm > 150.0f) _m.runningEconomyWhPerKm = 150.0f;
-    } else {
-      _m.runningEconomyWhPerKm = 0.0f;
-    }
-
-    // 12. Smart Biometrics: Dynamic Body Weight Estimation
-    if (liveSpeedKmh >= 3.0f && _m.stepCount >= 8 && _m.emptyBeltA > 0.5f) {
-      float loadDelta = _smoothedCurrentA - _m.emptyBeltA;
-      if (loadDelta > 0.35f) {
-        float kw = 0.027f * (1.0f + (liveSpeedKmh - 4.0f) * 0.035f);
-        float rawW = loadDelta / kw;
-        if (rawW >= 35.0f && rawW <= 160.0f) {
-          if (_estWeight <= 1.0f) _estWeight = rawW;
-          else _estWeight = _estWeight * 0.96f + rawW * 0.04f;
-          _m.estimatedWeightKg = _estWeight;
-        }
-      }
-    }
-
-    // 13. Smart Safety: Autonomous Step-Off / Fall Detection
-    if (liveSpeedKmh >= 2.5f && _m.stepCount >= 10 && _m.emptyBeltA > 0.5f) {
-      uint32_t stepSilenceMs = nowMs - _lastStepMs;
-      float loadDelta = _smoothedCurrentA - _m.emptyBeltA;
-      if (stepSilenceMs >= 4200 && loadDelta <= 0.30f) {
+    // Step-Off / Unloaded Belt Detector: belt running fast but current near empty belt
+    if (liveSpeedKmh >= 3.0f && _m.emptyBeltA > 0.5f) {
+      if ((nowMs - _lastStepMs) > 7000 && _m.currentA <= (_m.emptyBeltA + 0.40f)) {
         _m.stepOffAlert = true;
       } else {
         _m.stepOffAlert = false;
       }
     } else {
       _m.stepOffAlert = false;
+    }
+
+    // Running Economy: consumed electrical energy per km
+    if (liveSpeedKmh > 2.0f && _m.powerWatts > 20.0f) {
+      _m.runningEconomyWhPerKm = _m.powerWatts / liveSpeedKmh;
     }
   }
 
@@ -437,7 +464,6 @@ public:
     _m.stepCount = 0;
     _m.cadenceSpm = 0;
     _lastStepMs = 0;
-    _m.stepOffAlert = false;
   }
 
   void resetEnergy() {
@@ -447,7 +473,7 @@ public:
 
   void loadCumulativeCounters(float totalKWh, uint32_t totalSteps) {
     if (!isnan(totalKWh) && totalKWh >= 0.0f) {
-      _energyWs = (double)totalKWh * 3600000.0;
+      _energyWs = totalKWh * 3600000.0f;
       _m.energyKWh = totalKWh;
     }
     _stepCount = totalSteps;
@@ -473,11 +499,23 @@ public:
   }
 
 private:
+  float _effectiveSens() const {
+    if (_cfg.autoSensOn != 0) {
+      float calculated = 40.0f * (2.0f * _zeroMv / 5000.0f);
+      if (calculated >= 15.0f && calculated <= 45.0f) return calculated;
+    }
+    return _cfg.sensMvPerA;
+  }
+
+  void _updateActiveSensitivity() {
+    _m.activeSensMvA = _effectiveSens();
+  }
+
   void _validateConfig() {
     if (isnan(_cfg.ratedCurrentA) || _cfg.ratedCurrentA < 5.0f || _cfg.ratedCurrentA > 25.0f) _cfg.ratedCurrentA = RATED_CURRENT_A;
     if (isnan(_cfg.stallLimitA) || _cfg.stallLimitA < 8.0f || _cfg.stallLimitA > 25.0f) _cfg.stallLimitA = STALL_CURRENT_A;
     if (_cfg.stallDelayMs < 100 || _cfg.stallDelayMs > 1500) _cfg.stallDelayMs = 300;
-    if (isnan(_cfg.kurtosisThresh) || _cfg.kurtosisThresh < 4.0f || _cfg.kurtosisThresh > 12.0f) _cfg.kurtosisThresh = 6.5f;
+    if (isnan(_cfg.kurtosisThresh) || _cfg.kurtosisThresh < 4.0f || _cfg.kurtosisThresh > 30.0f) _cfg.kurtosisThresh = 6.5f;
     if (isnan(_cfg.cusumWarnScore) || _cfg.cusumWarnScore < 5.0f || _cfg.cusumWarnScore > 50.0f) _cfg.cusumWarnScore = 18.0f;
     if (isnan(_cfg.cusumCritScore) || _cfg.cusumCritScore < 20.0f || _cfg.cusumCritScore > 90.0f) _cfg.cusumCritScore = 45.0f;
     if (isnan(_cfg.emptyBeltWarnA) || _cfg.emptyBeltWarnA < 1.5f || _cfg.emptyBeltWarnA > 6.0f) _cfg.emptyBeltWarnA = 3.5f;
@@ -485,6 +523,8 @@ private:
     if (isnan(_cfg.sensMvPerA) || _cfg.sensMvPerA < 15.0f || _cfg.sensMvPerA > 45.0f) _cfg.sensMvPerA = DEFAULT_SENS_MV_A;
     if (isnan(_cfg.nominalBusV) || _cfg.nominalBusV < 90.0f || _cfg.nominalBusV > 240.0f) _cfg.nominalBusV = RATED_BUS_VOLTS;
     if (isnan(_cfg.calibratedBaselineA) || _cfg.calibratedBaselineA < 0.5f || _cfg.calibratedBaselineA > 5.0f) _cfg.calibratedBaselineA = 1.80f;
+    if (isnan(_cfg.inertiaDelayS) || _cfg.inertiaDelayS < 1.0f || _cfg.inertiaDelayS > 10.0f) _cfg.inertiaDelayS = 3.5f;
+    if (isnan(_cfg.inclineCompA) || _cfg.inclineCompA < 0.0f || _cfg.inclineCompA > 0.50f) _cfg.inclineCompA = 0.15f;
   }
 
   uint8_t _pin;

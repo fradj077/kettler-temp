@@ -85,8 +85,8 @@ volatile uint32_t tmSpeedMs = 0;
 
 void dspTask(void*) {
   for (;;) {
-    dspEngine.processBurst(millis(), tmSpeed);
-    vTaskDelay(pdMS_TO_TICKS(180));
+    dspEngine.processBurst(millis(), tmSpeed, tmIncl);
+    vTaskDelay(pdMS_TO_TICKS(80));
   }
 }
 
@@ -152,13 +152,17 @@ void handleLine(const char* l) {
       case 'F': c.ratedCurrentA = constrain(v, 5.0f, 25.0f); break;
       case 'L': c.stallLimitA   = constrain(v, 8.0f, 25.0f); break;
       case 'D': c.stallDelayMs  = (uint16_t)constrain(v, 100.0f, 1500.0f); break;
-      case 'K': c.kurtosisThresh = constrain(v, 4.0f, 12.0f); break;
+      case 'K': c.kurtosisThresh = constrain(v, 4.0f, 30.0f); break;
       case 'W': c.cusumWarnScore = constrain(v, 5.0f, 50.0f); break;
       case 'C': c.cusumCritScore = constrain(v, 20.0f, 90.0f); break;
       case 'B': c.emptyBeltWarnA = constrain(v, 1.5f, 6.0f); break;
       case 'T': c.stepDeltaA     = constrain(v, 0.08f, 0.80f); break;
       case 'S': c.sensMvPerA     = constrain(v, 15.0f, 45.0f); break;
       case 'V': c.nominalBusV    = constrain(v, 90.0f, 240.0f); break;
+      case 'E': c.autoSensOn     = v >= 0.5f ? 1 : 0; break;
+      case 'J': c.inertiaDelayS  = constrain(v, 1.0f, 10.0f); break;
+      case 'N': c.inclineCompA   = constrain(v, 0.0f, 0.50f); break;
+      case 'Z': c.zeroTrackingOn = v >= 0.5f ? 1 : 0; break;
     }
     dspEngine.setConfig(c);
     dspDirty = true;
@@ -887,12 +891,13 @@ void dspLoad() {
   dspEngine.loadCumulativeCounters(savedKWh, savedSteps);
 }
 void dspSend() {
-  char b[140];
+  char b[190];
   auto c = dspEngine.getConfig();
-  snprintf(b, sizeof b, "IPC:F=%.1f,L=%.1f,D=%u,K=%.1f,W=%.1f,C=%.1f,B=%.1f,T=%.2f,S=%.1f,V=%.1f,BL=%.2f\n",
+  snprintf(b, sizeof b, "IPC:F=%.1f,L=%.1f,D=%u,K=%.1f,W=%.1f,C=%.1f,B=%.1f,T=%.2f,S=%.1f,V=%.1f,BL=%.2f,AE=%u,IJ=%.1f,NC=%.2f,ZT=%u\n",
            c.ratedCurrentA, c.stallLimitA, (unsigned)c.stallDelayMs,
            c.kurtosisThresh, c.cusumWarnScore, c.cusumCritScore,
-           c.emptyBeltWarnA, c.stepDeltaA, c.sensMvPerA, c.nominalBusV, c.calibratedBaselineA);
+           c.emptyBeltWarnA, c.stepDeltaA, c.sensMvPerA, c.nominalBusV, c.calibratedBaselineA,
+           (unsigned)c.autoSensOn, c.inertiaDelayS, c.inclineCompA, (unsigned)c.zeroTrackingOn);
   sendLong(b);
 }
 void dspPump() {
@@ -955,6 +960,8 @@ void sendStatus() {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(PIN_DS, INPUT_PULLUP);
+  delay(50);
   ds.begin();
   ds.setResolution(12);
   ds.setWaitForConversion(false);
@@ -1029,7 +1036,7 @@ void setup() {
   adv->start();
 
   dspEngine.begin(PIN_ACS, 180.0f, 26.4f);
-  xTaskCreatePinnedToCore(dspTask, "dspTask", 8192, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(dspTask, "dspTask", 8192, nullptr, 1, nullptr, 0);
   xTaskCreate(guardTask, "guard", 8192, nullptr, 1, nullptr);
 }
 
