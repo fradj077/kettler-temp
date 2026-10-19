@@ -36,6 +36,7 @@ struct DspConfig {
   float inertiaDelayS;        // Delay before lubrication baseline measurement (Default: 3.5s, Range: 1.0 - 10.0s)
   float inclineCompA;         // Incline current compensation per 1% grade (Default: 0.15A/%, Range: 0.0 - 0.50A/%)
   uint8_t zeroTrackingOn;     // 1 = Dynamic thermal zero tracking at idle, 0 = Fixed zero (Default: 1)
+  float weightKgPerA;         // Universal Body Mass Calibration Constant (Default: 32.0 kg/A, Range: 15.0 - 85.0 kg/A)
 };
 
 struct Metrics {
@@ -95,6 +96,7 @@ public:
     c.inertiaDelayS         = 3.5f;              // 3.5 seconds start delay to bypass acceleration
     c.inclineCompA          = 0.15f;             // 0.15 A per 1% grade
     c.zeroTrackingOn        = 1;                 // Default: Auto-track thermal zero at idle
+    c.weightKgPerA          = 32.0f;             // Calibrated universal constant: 32.0 kg/A
     return c;
   }
 
@@ -442,7 +444,7 @@ public:
       }
 
       // 10. التقدير الديناميكي الشامل لوزن أي راكب (Universal Dynamic Body Mass Estimator)
-      // معايرة فيزيائية مثبتة ميدانياً: كل 1.0 أمبير سحب صافٍ إضافي فوق السير الفارغ = 64.75 كغ
+      // معايرة فيزيائية مثبتة ميدانياً: كل 1.0 أمبير سحب صافٍ إضافي فوق السير الفارغ = 32.0 كغ (مثبت ميدانياً: 79 كغ = 2.47A صافي)
       // تعطي 79 كغ بدقة متناهية عند سحب 2.30A، وتتكيف ذاتياً مع أي شخص آخر (40 - 150 كغ)
       float loadDeltaA = _smoothedCurrentA - emptyRef;
       if (loadDeltaA >= 0.45f) {
@@ -450,7 +452,7 @@ public:
         if (liveSpeedKmh >= 2.0f && liveSpeedKmh <= 16.0f) {
           speedCorr = 1.0f / (1.0f + 0.012f * (liveSpeedKmh - 4.0f));
         }
-        float rawEstKg = (loadDeltaA * 64.75f) * speedCorr;
+        float rawEstKg = (loadDeltaA * _cfg.weightKgPerA) * speedCorr;
         if (rawEstKg >= 35.0f && rawEstKg <= 160.0f) {
           if (_estWeight < 35.0f) _estWeight = rawEstKg;
           else _estWeight = _estWeight * 0.96f + rawEstKg * 0.04f;
@@ -544,6 +546,7 @@ private:
     if (isnan(_cfg.calibratedBaselineA) || _cfg.calibratedBaselineA < 0.5f || _cfg.calibratedBaselineA > 5.0f) _cfg.calibratedBaselineA = 1.80f;
     if (isnan(_cfg.inertiaDelayS) || _cfg.inertiaDelayS < 1.0f || _cfg.inertiaDelayS > 10.0f) _cfg.inertiaDelayS = 3.5f;
     if (isnan(_cfg.inclineCompA) || _cfg.inclineCompA < 0.0f || _cfg.inclineCompA > 0.50f) _cfg.inclineCompA = 0.15f;
+    if (isnan(_cfg.weightKgPerA) || _cfg.weightKgPerA < 15.0f || _cfg.weightKgPerA > 90.0f) _cfg.weightKgPerA = 32.0f;
   }
 
   uint8_t _pin;

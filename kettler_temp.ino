@@ -173,6 +173,28 @@ void handleLine(const char* l) {
     }
     return;
   }
+  if (l[0] == 'C' && l[1] == 'W') { // CW<weight>: معايرة ذكية حية للوزن بنقرة واحدة
+    float userWeight = atof(l + 2);
+    if (userWeight >= 30.0f && userWeight <= 160.0f) {
+      auto m = dspEngine.getMetrics();
+      float emptyRef = m.emptyBeltA > 0.5f ? m.emptyBeltA : 1.08f;
+      float deltaA = m.currentA - emptyRef;
+      if (deltaA >= 0.40f) {
+        auto c = dspEngine.getConfig();
+        c.weightKgPerA = constrain(userWeight / deltaA, 15.0f, 85.0f);
+        dspEngine.setConfig(c);
+        dspDirty = true;
+        dspDirtyMs = millis();
+        Serial.printf("[CALIB] Weight factor calibrated to %.2f kg/A for user %.1f kg (delta: %.2f A)\n", c.weightKgPerA, userWeight, deltaA);
+        if (connected) {
+          char b[64];
+          snprintf(b, sizeof b, "CW:OK=%.1f,K=%.2f\n", userWeight, c.weightKgPerA);
+          sendLine(b);
+        }
+      }
+    }
+    return;
+  }
   if (l[0] == 'P') { // ضبط هوامش ومعايرة الـ DSP: PF, PL, PD, PK, PW, PC, PB, PT, PS, PV, PQ, PR
     if (l[1] == 'Q') { dspQuery = true; return; }
     if (l[1] == 'R') { dspEngine.resetConfigToDefaults(); dspDirty = true; dspDirtyMs = millis(); return; }
@@ -193,6 +215,7 @@ void handleLine(const char* l) {
       case 'J': c.inertiaDelayS  = constrain(v, 1.0f, 10.0f); break;
       case 'N': c.inclineCompA   = constrain(v, 0.0f, 0.50f); break;
       case 'Z': c.zeroTrackingOn = v >= 0.5f ? 1 : 0; break;
+      case 'X': c.weightKgPerA = constrain(v, 15.0f, 90.0f); break;
     }
     dspEngine.setConfig(c);
     dspDirty = true;
