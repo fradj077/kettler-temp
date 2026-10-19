@@ -408,8 +408,13 @@ public:
           _stepArmed = true;
         }
       } else {
-        // تسجيل الخطوة المؤكدة فور ضربة القدم وصعود الإشارة في القمة (>= +0.07A)
-        if (acGait >= 0.07f && dtStep >= 230) {
+        // عتبة تكيفية ذاتية ذكية: تتكيف تلقائياً بين المشي والجري دون أي تدخل يدوي
+        float dynPeak = (_leftPeakSum + _rightPeakSum) * 0.5f;
+        float triggerThresh = (dynPeak > 0.03f) ? (0.05f + dynPeak * 0.20f) : 0.06f;
+        if (triggerThresh > 0.15f) triggerThresh = 0.15f;
+
+        // تسجيل الخطوة المؤكدة فور تجاوز العتبة التكيفية
+        if (acGait >= triggerThresh && dtStep >= 230) {
           _stepArmed = false;
           _stepCount++;
           _m.stepCount = _stepCount;
