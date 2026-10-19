@@ -96,8 +96,8 @@ public:
     DspConfig c;
     c.ratedCurrentA         = RATED_CURRENT_A;   // 10.0f
     c.stallLimitA           = STALL_CURRENT_A;   // 15.0f
-    c.stallDelayMs          = 300;               // 300 ms
-    c.kurtosisThresh        = 6.5f;              // K > 6.5
+    c.stallDelayMs          = 800;               // 300 ms
+    c.kurtosisThresh        = 18.0f;              // K > 6.5
     c.cusumWarnScore        = 18.0f;             // Score >= 18.0 -> Warning
     c.cusumCritScore        = 45.0f;             // Score >= 45.0 -> Critical
     c.emptyBeltWarnA        = 3.5f;              // Empty belt > 3.5A -> Needs silicone lubrication
@@ -121,7 +121,7 @@ public:
       _stepCount(0), _lastStepMs(0),
       _stepLpCurrent(0.0f), _prevStepSlope(0.0f),
       _leftPeakSum(0.0f), _rightPeakSum(0.0f),
-      _stepAlternator(false), _symmetryPct(100.0f),
+      _stepAlternator(false), _symmetryPct(100.0f), _stepArmed(true), _estWeight(75.0f),
       _stallStartMs(0), _stallActive(false),
       _lastBurstMs(0), _smoothedCurrentA(0.0f),
       _estWeight(0.0f)
@@ -200,7 +200,7 @@ public:
 
   // Main high-speed processing burst, called every ~180-250 ms from dedicated FreeRTOS task
   void processBurst(uint32_t nowMs, float liveSpeedKmh, float liveInclPct = 0.0f) {
-    if (nowMs - _lastBurstMs < 140) return;
+    if (nowMs - _lastBurstMs < 45) return;
     _lastBurstMs = nowMs;
 
     // 1. High-speed burst capture into member buffer (allocated in SRAM, not stack)
@@ -514,8 +514,8 @@ private:
   void _validateConfig() {
     if (isnan(_cfg.ratedCurrentA) || _cfg.ratedCurrentA < 5.0f || _cfg.ratedCurrentA > 25.0f) _cfg.ratedCurrentA = RATED_CURRENT_A;
     if (isnan(_cfg.stallLimitA) || _cfg.stallLimitA < 8.0f || _cfg.stallLimitA > 25.0f) _cfg.stallLimitA = STALL_CURRENT_A;
-    if (_cfg.stallDelayMs < 100 || _cfg.stallDelayMs > 1500) _cfg.stallDelayMs = 300;
-    if (isnan(_cfg.kurtosisThresh) || _cfg.kurtosisThresh < 4.0f || _cfg.kurtosisThresh > 30.0f) _cfg.kurtosisThresh = 6.5f;
+    if (_cfg.stallDelayMs < 100 || _cfg.stallDelayMs > 1500) _cfg.stallDelayMs = 800;
+    if (isnan(_cfg.kurtosisThresh) || _cfg.kurtosisThresh < 4.0f || _cfg.kurtosisThresh > 30.0f) _cfg.kurtosisThresh = 18.0f;
     if (isnan(_cfg.cusumWarnScore) || _cfg.cusumWarnScore < 5.0f || _cfg.cusumWarnScore > 50.0f) _cfg.cusumWarnScore = 18.0f;
     if (isnan(_cfg.cusumCritScore) || _cfg.cusumCritScore < 20.0f || _cfg.cusumCritScore > 90.0f) _cfg.cusumCritScore = 45.0f;
     if (isnan(_cfg.emptyBeltWarnA) || _cfg.emptyBeltWarnA < 1.5f || _cfg.emptyBeltWarnA > 6.0f) _cfg.emptyBeltWarnA = 3.5f;
@@ -551,6 +551,8 @@ private:
   float _rightPeakSum;
   bool _stepAlternator;
   float _symmetryPct;
+  bool _stepArmed;
+  float _estWeight;
 
   uint32_t _stallStartMs;
   bool _stallActive;

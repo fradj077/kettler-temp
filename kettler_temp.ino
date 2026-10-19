@@ -86,7 +86,37 @@ volatile uint32_t tmSpeedMs = 0;
 void dspTask(void*) {
   for (;;) {
     dspEngine.processBurst(millis(), tmSpeed, tmIncl);
-    vTaskDelay(pdMS_TO_TICKS(80));
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+}
+
+
+// ---------- تشخيص أسباب التوقف وحالة الأمان المتقدمة ----------
+enum StopReasonCode : uint8_t {
+  STOP_NONE = 0,             // طبيعي / لا يوجد خطأ
+  STOP_USER_CONSOLE = 1,     // توقف عادي من أزرار كونسول المشاية
+  STOP_SAFETY_KEY = 2,       // فصل مفتاح الأمان المغناطيسي للمشاية
+  STOP_TEMP_HOT = 3,         // حماية حرارية: تجاوز 80°م
+  STOP_STALL_OVERLOAD = 4,   // حماية انحشار المحرك: تيار > 15A
+  STOP_TEMP_GLITCH = 5,      // اهتزاز أو انقطاع سلك حساس الحرارة
+  STOP_BLE_TIMEOUT = 6,      // مهلة أمان البلوتوث / فقدان الاتصال
+  STOP_MANUAL_APP = 7        // إيقاف من تطبيق الويب
+};
+
+volatile uint8_t lastStopCode = STOP_NONE;
+volatile uint32_t lastStopMs = 0;
+char lastStopReason[48] = "NORMAL";
+
+void setStopReason(uint8_t code, const char* reason) {
+  lastStopCode = code;
+  lastStopMs = millis();
+  strncpy(lastStopReason, reason, sizeof(lastStopReason) - 1);
+  lastStopReason[sizeof(lastStopReason) - 1] = 0;
+  Serial.printf("[DIAG] Event Code: %d, Reason: %s\n", code, reason);
+  if (connected) {
+    char b[64];
+    snprintf(b, sizeof b, "DIAG:C=%d,R=%s\n", code, reason);
+    sendLine(b);
   }
 }
 
@@ -686,17 +716,16 @@ size_t lockDecide(LockState& s, uint32_t now, bool fresh, float cur, bool hard, 
 // قليلة (عند تغيّر المرحلة فقط)، وقطع الاتصال بعد 20 ثانية من الصمت كان يوقف المشاية أثناء البرنامج.
 bool wantLink(uint32_t now, bool lock, bool manual, uint32_t ftmsAct, uint32_t dOff, float temp, float warn, bool gone, bool moving) {
   if (lock) return true;
+  // أمان وحصانة الاتصال: ما دام السير يدور أو المحرك يستهلك تياراً، يُمنع قطع الاتصال إطلاقاً
+  if (moving) return true;
   // إذا لم يكن الهاتف متصلًا باللوحة أصلاً، لا تقم بالمسح إطلاقاً لكي يظل راديو البلوتوث حراً ويستقبل اتصال الهاتف فوراً
   if (!gServer || gServer->getConnectedCount() == 0) return false;
   if (manual && !gone) return true;
   bool appSince = ftmsAct && (!dOff || (int32_t)(ftmsAct - dOff) > 0);
-  if (moving && appSince && !gone) return true;
-  bool fresh = ftmsAct && (uint32_t)(now - ftmsAct) < IDLE_MS;
-  if (fresh && dOff && (int32_t)(ftmsAct - dOff) <= 0) fresh = false;
-  if (gone) fresh = false;
+  if (appSince && !gone) return true;
   bool weakOk = !dOff || (uint32_t)(now - dOff) > 60000UL;
   bool standby = weakOk && temp > -50.0f && temp >= warn - 2.0f;
-  return fresh || standby;
+  return standby;
 }
 
 void guardTask(void*) {
@@ -782,6 +811,16 @@ void bridgePump(uint32_t now) {
   if (nSt > 0) {
     fmStatus->setValue(bSt, nSt);
     fmStatus->notify();
+
+    // فك شفرة أسباب توقف المشاية الحقيقية من كونسول Kettler عبر بروتوكول FTMS
+    uint8_t op = bSt[0];
+    if (op == 0x02 || op == 0x01) {
+      setStopReason(STOP_USER_CONSOLE, "CONSOLE_STOP");
+    } else if (op == 0x03) {
+      setStopReason(STOP_SAFETY_KEY, "SAFETY_KEY_PULLED");
+    } else if (op == 0x08) {
+      setStopReason(STOP_BLE_TIMEOUT, "FTMS_CTRL_LOST");
+    }
   }
   if (fmGot) {                                        // حفظ مواصفات المشاية وإظهارها للتطبيقات
     fmGot = false;
@@ -802,22 +841,41 @@ void onTemp(uint32_t now, float t) {
   char b[32];
   if (t <= -100.0f) {                 // الحساس غير متصل (-127)
     Serial.println("DS18B20 not found");
+    setStopReason(STOP_TEMP_GLITCH, "TEMP_DISCONNECTED");
     if (connected) sendLine("Temp: ERR\n");
     return;
   }
   if (t == 85.0f) return;             // قيمة التشغيل الأولى
+
+  // فلتر نبضات الحرارة الكاذبة: إهمال أي قفزة فيزيائية تفوق 4.5°م في قراءة واحدة ناتجة عن اهتزاز السلك
+  static float lastValidTemp = -100.0f;
+  if (lastValidTemp > -50.0f && fabsf(t - lastValidTemp) > 4.5f) {
+    Serial.printf("[TEMP] Glitch rejected: %.2f C (previous: %.2f C)\n", t, lastValidTemp);
+    return;
+  }
+  lastValidTemp = t;
   lastTemp = t;
   mhe.feedTemp(now, t);
 
-  // 3 قراءات متتالية فوق حد الخطر لتفعيل الحماية، والنزول تحت حد التحذير لإلغائها
-  if (t >= hotC) { if (hotCnt < 255) hotCnt++; if (hotCnt >= 3) lockOn = true; }
-  else hotCnt = 0;
+  // 4 قراءات متتالية مؤكدة فوق حد الخطر لتفعيل الحماية، والنزول تحت حد التحذير لإلغائها
+  if (t >= hotC) {
+    if (hotCnt < 255) hotCnt++;
+    if (hotCnt >= 4) {
+      lockOn = true;
+      setStopReason(STOP_TEMP_HOT, "HIGH_TEMP_80C");
+    }
+  } else {
+    hotCnt = 0;
+  }
 
-  // تأكيد حد الإيقاف الفوري (قراءتان متتاليتان على الأقل فوق hotC + 5 لمنع التوقف المفاجئ الناتج عن تشويش الحساس)
+  // تأكيد حد الإيقاف الفوري (3 قراءات متتالية فوق hotC + 5)
   static uint8_t hardCnt = 0;
   if (t >= hotC + 5.0f) {
     if (hardCnt < 255) hardCnt++;
-    if (hardCnt >= 2) hardStop = true;
+    if (hardCnt >= 3) {
+      hardStop = true;
+      setStopReason(STOP_TEMP_HOT, "CRITICAL_TEMP_85C");
+    }
   } else {
     hardCnt = 0;
     hardStop = false;
@@ -951,7 +1009,7 @@ void sendStatus() {
   static const char* names[] = {"OFF", "SCAN", "ON", "FAIL"};
   char b[32];
   uint8_t st = guardState;
-  snprintf(b, sizeof b, "ST:%s\nLK:%d\n", names[st > 3 ? 0 : st], lockOn ? 1 : 0);
+  snprintf(b, sizeof b, "ST:%s\nLK:%d\nDIAG:%d,%s\n", names[st > 3 ? 0 : st], lockOn ? 1 : 0, lastStopCode, lastStopReason);
   sendLine(b);
   lastSentState = st;
   lastSentLock = lockOn ? 1 : 0;
@@ -1058,7 +1116,8 @@ void loop() {
   static uint32_t lastClientMs = 0;
   if (gServer->getConnectedCount() > 0) lastClientMs = now;
   bool gone = (uint32_t)(now - lastClientMs) > IDLE_MS;
-  bool moving = (uint32_t)(now - tmSpeedMs) < 4000 && tmSpeed > 0.3f;
+  bool isMotorRunning = (dspEngine.getMetrics().currentA > 0.35f);
+  bool moving = ((uint32_t)(now - tmSpeedMs) < 5000 && tmSpeed > 0.3f) || isMotorRunning;
   guardWant = wantLink(now, lockOn, manualLink, ftmsLastAct, dOffAt, lastTemp, warnC, gone, moving);
 
   if (connected && now - connMs > 1500) {
@@ -1072,13 +1131,14 @@ void loop() {
     lastCurMs = now;
     auto m = dspEngine.getMetrics();
     char b[128];
-    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f\n",
+    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f,WT=%.1f\n",
              m.currentA, m.kurtosis, (int)m.brushHealth, m.powerWatts,
-             (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct);
+             (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct, m.estimatedWeightKg);
     sendLine(b);
     if (m.stallAlert) {
       hardStop = true;
       lockOn = true;
+      setStopReason(STOP_STALL_OVERLOAD, "STALL_OVERLOAD_15A");
     }
   }
   static uint32_t lastCounterSaveMs = 0;
