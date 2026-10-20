@@ -1,7 +1,28 @@
 // ============================================================================
-// كود لوحة Kettler-Temp المخصص لشريحة ESP32-S3 N16R8 (Dual Core LX7)
-// الإصدار المدمج المطور: Argon-Spark v29 Industrial Edition
+// كود لوحة Kettler-Temp المخصص لشريحة ESP32-S3 N16 (16MB Flash / Dual Core LX7)
+// ----------------------------------------------------------------------------
+// إعدادات البناء والترجمة في Arduino IDE:
+//   - Board: "ESP32S3 Dev Module"
+//   - Flash Size: "16MB (128Mb)"
+//   - Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)" أو "app3M_fat9M_16MB"
+//   - Flash Mode: "QIO 80MHz" أو "DIO 80MHz"
+//   - PSRAM: "OPI PSRAM" (إذا كانت N16R8) أو "Disabled" (إذا كانت N16 فقط)
+//   - CPU Frequency: "240MHz (WiFi/BT)"
+//   - Upload Speed: 921600
+// ----------------------------------------------------------------------------
+// توزيع الموارد على الشريحة:
+//   - Core 0: معالجة الـ DSP وتيار ACS758 بسرعة 8.33 kHz (dspTask)
+//   - Core 1: بروتوكول البلوتوث (NimBLE Stack) ومراقبة الحماية وقراءة الحرارة
+//   - ADC1 (GPIO 5): قراءة مستمرة ومستقلة تماماً لا تتأثر بالبلوتوث إطلاقاً
 // ============================================================================
+// Kettler-Temp v3 : ESP32-S3 + DS18B20 (GPIO 4)
+//  * يرسل حرارة المحرك للتطبيق عبر Nordic UART  "Temp: 26.44 C"
+//  * وسيط FTMS: يظهر لتطبيقات مثل Kinomap وZwift كمشاية، ويمرّر أوامرها إلى المشاية الحقيقية
+//    ولا يتصل بالمشاية إلا عند الحاجة (تطبيق متصل به، أو ارتفاع الحرارة، أو زر الربط)
+//  * حماية: عند تجاوز حد الخطر يخفّض السرعة تدريجيًا ثم يوقف المشاية ويمنع إعادة التشغيل
+//    حتى تنزل الحرارة تحت حد التحذير. حدّا الحرارة (W و H) يرسلهما التطبيق ويحفظهما.
+//  * تحليل صحة المحرك (MotorHealth.h) وتحديث البرنامج بالبلوتوث (OTA، الرمز OTA_PIN)
+// المكتبة: NimBLE-Arduino 1.4.x
 #include <NimBLEDevice.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -19,27 +40,29 @@
 #define OTA_SVC  "6e400010-b5a3-f393-e0a9-e50e24dcca9e"
 #define OTA_CTL  "6e400011-b5a3-f393-e0a9-e50e24dcca9e"
 #define OTA_DAT  "6e400012-b5a3-f393-e0a9-e50e24dcca9e"
-#define OTA_PIN  "4827"
+#define OTA_PIN  "4827"      // رمز تحديث البرنامج: غيّره هنا وفي حقل الرمز بالتطبيق
 
 #define U16(x) NimBLEUUID((uint16_t)(x))
 
+// الأنواع هنا في الأعلى: مترجم Arduino يولّد تعريفات الدوال تلقائيًا قبل أول دالة
 struct Fwd { uint8_t n; uint8_t d[10]; uint32_t ms; };
 struct LockState { uint32_t last; bool stopped; float lastTarget; };
+// إعدادات تُضبط من التطبيق وتُحفظ في ذاكرة اللوحة
 struct Cfg {
-  float maxSpd;
-  float maxInc;
-  float accel;
-  float decel;
-  float capMin;
-  uint8_t capOn;
-  uint8_t cdMin;
+  float maxSpd;     // أقصى سرعة مسموحة كم/س (0 = حد المشاية نفسها)
+  float maxInc;     // أقصى ميل مسموح % (0 = حد المشاية)
+  float accel;      // أقصى تسارع كم/س في الثانية (0 = بلا حد): بداية آمنة
+  float decel;      // أقصى تباطؤ كم/س في الثانية (0 = بلا حد)
+  float capMin;     // أدنى سرعة مسموحة عند بلوغ حد الخطر
+  uint8_t capOn;    // تحديد السرعة بالحرارة بين التحذير والخطر
+  uint8_t cdMin;    // دقائق المشي البطيء قبل الإيقاف عند أمر الإيقاف (0 = إيقاف مباشر)
 };
 
 OneWire ow(PIN_DS);
 DallasTemperature ds(&ow);
 NimBLEServer* gServer = nullptr;
 NimBLECharacteristic* txChar = nullptr;
-volatile bool connected = false;
+volatile bool connected = false;     // تطبيق الويب اشترك في قناة الحرارة
 volatile bool needStatus = false;
 volatile uint32_t connMs = 0;
 
@@ -56,37 +79,28 @@ volatile uint32_t cfgDirtyMs = 0;
 mh::Engine mhe;
 dsp::MotorCurrentDSP dspEngine;
 
+// Live speed from treadmill bridge (forward-declared for dspTask)
 volatile float tmSpeed = 0, tmIncl = 0;
 volatile uint32_t tmSpeedMs = 0;
 
-// Forward declarations
-void sendLine(const char* s);
-void sendLong(const char* s);
-void dspSave();
-
 void dspTask(void*) {
   for (;;) {
-    // في حال عدم اتصال بلوتوث المشاية بينما المحرك يعمل فعلياً، نمرر سرعة تقديرية لكي تعمل خوارزميات الـ DSP
-    float effSpeed = tmSpeed;
-    if ((uint32_t)(millis() - tmSpeedMs) >= 4000) {
-      float curA = dspEngine.getMetrics().currentA;
-      effSpeed = (curA >= 0.65f) ? 4.0f : 0.0f;
-    }
-    dspEngine.processBurst(millis(), effSpeed, tmIncl);
+    dspEngine.processBurst(millis(), tmSpeed, tmIncl);
     vTaskDelay(pdMS_TO_TICKS(15));
   }
 }
 
+
 // ---------- تشخيص أسباب التوقف وحالة الأمان المتقدمة ----------
 enum StopReasonCode : uint8_t {
-  STOP_NONE = 0,
-  STOP_USER_CONSOLE = 1,
-  STOP_SAFETY_KEY = 2,
-  STOP_TEMP_HOT = 3,
-  STOP_STALL_OVERLOAD = 4,
-  STOP_TEMP_GLITCH = 5,
-  STOP_BLE_TIMEOUT = 6,
-  STOP_MANUAL_APP = 7
+  STOP_NONE = 0,             // طبيعي / لا يوجد خطأ
+  STOP_USER_CONSOLE = 1,     // توقف عادي من أزرار كونسول المشاية
+  STOP_SAFETY_KEY = 2,       // فصل مفتاح الأمان المغناطيسي للمشاية
+  STOP_TEMP_HOT = 3,         // حماية حرارية: تجاوز 80°م
+  STOP_STALL_OVERLOAD = 4,   // حماية انحشار المحرك: تيار > 15A
+  STOP_TEMP_GLITCH = 5,      // اهتزاز أو انقطاع سلك حساس الحرارة
+  STOP_BLE_TIMEOUT = 6,      // مهلة أمان البلوتوث / فقدان الاتصال
+  STOP_MANUAL_APP = 7        // إيقاف من تطبيق الويب
 };
 
 volatile uint8_t lastStopCode = STOP_NONE;
@@ -106,16 +120,14 @@ void setStopReason(uint8_t code, const char* reason) {
   }
 }
 
-// ---------- سجل الأعطال المثبتة (Latched Faults) ----------
+// ---------- سجل الأعطال المثبتة ومعمارية الأمان الصناعية (Latched Faults) ----------
 #define FAULT_NONE          0x00
-#define FAULT_STALL_LATCH   0x01
-#define FAULT_TEMP_HOT      0x02
-#define FAULT_TEMP_CRIT     0x04
-#define FAULT_TEMP_DISC     0x08
+#define FAULT_STALL_LATCH   0x01   // عطل انحشار التيار (لا يُمحى إلا بعد التوقف التام للسير)
+#define FAULT_TEMP_HOT      0x02   // عطل حرارة المحرك فوق 80°م
+#define FAULT_TEMP_CRIT     0x04   // حرارة حرجة فوق 85°م (إيقاف فوري)
+#define FAULT_TEMP_DISC     0x08   // انقطاع حساس الحرارة أثناء تشغيل المحرك
 
 volatile uint8_t latchedFaults = FAULT_NONE;
-volatile bool lockOn = false;
-volatile bool hardStop = false;
 
 inline void updateFaultFlags() {
   lockOn = (latchedFaults != FAULT_NONE);
@@ -125,8 +137,10 @@ inline void updateFaultFlags() {
 // ---------- حدود الحرارة ----------
 float warnC = 60.0f, hotC = 80.0f;
 volatile float pendW = 0, pendH = 0;
-volatile bool manualLink = false;
-volatile uint32_t dOffAt = 0;
+volatile bool lockOn = false;        // حماية الحرارة فعّالة
+volatile bool hardStop = false;      // الحرارة فوق الخطر بفارق كبير: إيقاف فوري
+volatile bool manualLink = false;    // زر "ربط المشاية" في التطبيق
+volatile uint32_t dOffAt = 0;        // لحظة ضغط "فصل": تُلغي أسباب الاتصال الضعيفة بعدها
 volatile float lastTemp = -100.0f;
 uint8_t hotCnt = 0;
 float effWarn() { return warnC < hotC ? warnC : hotC - 5.0f; }
@@ -143,7 +157,7 @@ void mhTx(const char* d, size_t n) {
 void sendLine(const char* s) { mhTx(s, strlen(s)); }
 
 // ---------- استقبال أوامر تطبيق الويب ----------
-char lineBuf[128];  // was 48: BKR restore line can reach ~50 chars and was silently dropped
+char lineBuf[48];
 size_t lineLen = 0;
 void handleLine(const char* l) {
   if (l[0] == 'I' && l[1] == 'Z') { dspEngine.calibrateZero(200); return; }
@@ -160,7 +174,7 @@ void handleLine(const char* l) {
   }
   if (l[0] == 'W') { float v = atof(l + 1); if (v >= 20 && v <= 120) pendW = v; return; }
   if (l[0] == 'H') { float v = atof(l + 1); if (v >= 20 && v <= 120) pendH = v; return; }
-  if (l[0] == 'K') {
+  if (l[0] == 'K') {                       // إعدادات: KS سرعة، KI ميل، KA تسارع، KD تباطؤ، KT تحديد بالحرارة، KC دقائق المشي، KQ استعلام
     float v = atof(l + 2);
     switch (l[1]) {
       case 'S': cfg.maxSpd = v < 0 ? 0 : (v > 40 ? 40 : v); cfgDirty = true; cfgDirtyMs = millis(); break;
@@ -173,7 +187,7 @@ void handleLine(const char* l) {
     }
     return;
   }
-  if (l[0] == 'C' && l[1] == 'W') {
+  if (l[0] == 'C' && l[1] == 'W') { // CW<weight>: معايرة ذكية حية للوزن بنقرة واحدة
     float userWeight = atof(l + 2);
     if (userWeight >= 30.0f && userWeight <= 160.0f) {
       auto m = dspEngine.getMetrics();
@@ -195,7 +209,7 @@ void handleLine(const char* l) {
     }
     return;
   }
-  if (l[0] == 'P') {
+  if (l[0] == 'P') { // ضبط هوامش ومعايرة الـ DSP: PF, PL, PD, PK, PW, PC, PB, PT, PS, PV, PQ, PR
     if (l[1] == 'Q') { dspQuery = true; return; }
     if (l[1] == 'R') { dspEngine.resetConfigToDefaults(); dspDirty = true; dspDirtyMs = millis(); return; }
     float v = atof(l + 2);
@@ -215,15 +229,15 @@ void handleLine(const char* l) {
       case 'J': c.inertiaDelayS  = constrain(v, 1.0f, 10.0f); break;
       case 'N': c.inclineCompA   = constrain(v, 0.0f, 0.50f); break;
       case 'Z': c.zeroTrackingOn = v >= 0.5f ? 1 : 0; break;
-      case 'X': c.weightKgPerA   = constrain(v, 15.0f, 90.0f); break;
+      case 'X': c.weightKgPerA = constrain(v, 15.0f, 90.0f); break;
     }
     dspEngine.setConfig(c);
     dspDirty = true;
     dspDirtyMs = millis();
     return;
   }
-  if (l[0] == 'B') {
-    if (l[1] == 'K' && l[2] == 'Q') {
+  if (l[0] == 'B') { // أوامر النسخ الاحتياطي والاستعادة لحماية العدادات والمعايرات
+    if (l[1] == 'K' && l[2] == 'Q') { // BKQ: طلب تصدير النسخة الاحتياطية الشاملة
       char b[160];
       auto c = dspEngine.getConfig();
       snprintf(b, sizeof b, "BKP:H=%lu,M=%lu,N=%u,E=%.2f,S=%lu,BL=%.2f,STL=%.1f,W=%.1f,K=%.1f\n",
@@ -234,7 +248,7 @@ void handleLine(const char* l) {
       sendLong(b);
       return;
     }
-    if (l[1] == 'K' && l[2] == 'R') {
+    if (l[1] == 'K' && l[2] == 'R') { // BKR: استعادة العدادات والمعايرة
       const char* p = l + 4;
       float ekwh = -1.0f; long steps = -1; float bl = -1.0f;
       unsigned long totSec = 0, maintSec = 0;
@@ -268,9 +282,8 @@ void handleLine(const char* l) {
     }
   }
   if (l[0] == 'C') { manualLink = true; dOffAt = 0; return; }
-  if (l[0] == 'D') { manualLink = false; dOffAt = millis() | 1; setStopReason(STOP_MANUAL_APP, "APP_DISCONNECT"); return; }
+  if (l[0] == 'D') { manualLink = false; dOffAt = millis() | 1; return; }
 }
-
 void feedByte(char c) {
   if (c == '\n' || c == '\r') {
     if (lineLen) { lineBuf[lineLen] = 0; handleLine(lineBuf); lineLen = 0; }
@@ -280,7 +293,6 @@ void feedByte(char c) {
     lineLen = 0;
   }
 }
-
 class RxCb : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c) {
     auto v = c->getValue();
@@ -302,7 +314,10 @@ class SrvCb : public NimBLEServerCallbacks {
 };
 
 // ---------- تحديث البرنامج بالبلوتوث (OTA) ----------
-static const uint32_t OTA_RING = 16384;
+// الأوامر (عبر OTA_CTL): B<حجم>,<crc32 hex>,<رمز>  بدء | E إنهاء | X إلغاء
+// الردود: OK | A:<عدد البايتات المكتوبة> | DONE | ERR:<سبب>
+// البيانات (عبر OTA_DAT) تدخل مخزنًا حلقيًا وتُكتب في الذاكرة من الحلقة الرئيسية
+static const uint32_t OTA_RING = 16384;           // قوة 2
 static uint8_t otaRing[OTA_RING];
 volatile uint32_t ringHead = 0, ringTail = 0;
 volatile bool otaOverflow = false;
@@ -399,11 +414,11 @@ void otaPump() {
   int rounds = 0;
   while (ringTail != ringHead && rounds < 6) {
     uint32_t avail = ringHead - ringTail;
-    if (otaWritten == 0 && avail < 36) break;
+    if (otaWritten == 0 && avail < 36) break;           // نحتاج بداية الملف للتحقق منه
     size_t n = avail > 512 ? 512 : avail;
     uint8_t b[512];
     for (size_t i = 0; i < n; i++) b[i] = otaRing[(ringTail + i) & (OTA_RING - 1)];
-    if (otaWritten == 0) {
+    if (otaWritten == 0) {                              // علامة برنامج ESP32 عند البايت 32
       if (b[0] != 0xE9 || b[32] != 0x32 || b[33] != 0x54 || b[34] != 0xCD || b[35] != 0xAB) { otaAbort("ERR:notapp"); return; }
     }
     if (otaWritten + n > otaSize) { otaAbort("ERR:over"); return; }
@@ -422,19 +437,22 @@ void otaPump() {
   }
 }
 
-// ---------- وسيط FTMS ----------
+// ---------- وسيط FTMS: الجهة التي تتصل بها Kinomap وZwift ----------
 NimBLECharacteristic *fmFeat = nullptr, *fmData = nullptr, *fmStatus = nullptr,
                      *fmSpd = nullptr, *fmInc = nullptr, *fmCp = nullptr;
-volatile uint32_t ftmsLastAct = 0;
-uint8_t fmFeatB[8] = {0x0C, 0x10, 0, 0, 0x03, 0, 0, 0};
-uint8_t fmSpdB[6]  = {0x64, 0x00, 0xD0, 0x07, 0x32, 0x00};
-uint8_t fmIncB[6]  = {0x00, 0x00, 0x96, 0x00, 0x0A, 0x00};
-volatile bool fmGot = false;
-extern volatile bool tmLinked;
+volatile uint32_t ftmsLastAct = 0;   // آخر نشاط من تطبيق متصل بالوسيط
+uint8_t fmFeatB[8] = {0x0C, 0x10, 0, 0, 0x03, 0, 0, 0};          // مسافة+ميل+زمن | هدف السرعة والميل
+uint8_t fmSpdB[6]  = {0x64, 0x00, 0xD0, 0x07, 0x32, 0x00};       // 1 إلى 20 كم/س، خطوة 0.5
+uint8_t fmIncB[6]  = {0x00, 0x00, 0x96, 0x00, 0x0A, 0x00};       // 0 إلى 15%، خطوة 1
+volatile bool fmGot = false;         // قرأت اللوحة مواصفات المشاية الحقيقية
+extern volatile bool tmLinked;       // إعلان مسبق للارتباط بالمشاية لتفادي خطأ البناء
 
+// نتيجة أمر التحكم: 1 نجاح، 2 غير مدعوم، 5 غير مسموح (الحماية فعّالة)
 uint8_t cpDecide(uint8_t op, bool lock, bool* fwd) {
   *fwd = false;
-  if (!tmLinked) return 5;
+  if (!tmLinked) {
+    return 5; // التحكّم غير مسموح لأن المشاية الحقيقية غير متصلة بالوسيط بعد
+  }
   switch (op) {
     case 0x00: case 0x01: return 1;
     case 0x02: case 0x03: case 0x07: if (lock) return 5; *fwd = true; return 1;
@@ -483,6 +501,7 @@ class FmSubCb : public NimBLECharacteristicCallbacks {
 };
 
 // ---------- الاتصال بالمشاية الحقيقية (مهمة منفصلة) ----------
+// 0 غير متصلة، 1 بحث، 2 متصلة، 3 فشل
 volatile uint8_t guardState = 0;
 volatile bool guardWant = false;
 volatile bool tmLinked = false;
@@ -491,7 +510,7 @@ NimBLEClient* tmClient = nullptr;
 NimBLERemoteCharacteristic* tmCp = nullptr;
 NimBLEAddress tmAddr;
 volatile bool tmFound = false;
-static const uint8_t CMD_REQ[] = {0x00};
+static const uint8_t CMD_REQ[] = {0x00};          // Request Control
 
 static portMUX_TYPE pktMux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t tmPkt[32]; volatile uint8_t tmPktLen = 0; volatile bool tmPktNew = false;
@@ -516,13 +535,14 @@ void tmStatusNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   portEXIT_CRITICAL(&pktMux);
 }
 void cpNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
-  if (n >= 3 && d[0] == 0x80 && d[2] == 0x05) needCtrl = true;
+  if (n >= 3 && d[0] == 0x80 && d[2] == 0x05) needCtrl = true;   // 5 = لا صلاحية تحكم
 }
 
 class ScanCb : public NimBLEAdvertisedDeviceCallbacks {
   void onResult(NimBLEAdvertisedDevice* d) {
     std::string nm = d->getName();
     for (size_t i = 0; i < nm.size(); i++) nm[i] = toupper((unsigned char)nm[i]);
+    // استبعاد اللوحة نفسها قطعيًا لتفادي محاولة الاتصال بنفسها والتأخير
     if (nm.find("TEMP") != std::string::npos) return;
 
     bool ok = d->isAdvertisingService(U16(0x1826)) || (nm.find("KETTLER") != std::string::npos);
@@ -552,7 +572,7 @@ bool tmConnect() {
   sc->setActiveScan(true);
   sc->setInterval(100);
   sc->setWindow(80);
-  sc->start(3, false);
+  sc->start(3, false); // 3 ثوانٍ تكفي تمامًا لالتقاط المشاية بسرعة
   sc->clearResults();
   if (!tmFound) return false;
   if (!tmClient) { tmClient = NimBLEDevice::createClient(); tmClient->setConnectTimeout(8); }
@@ -561,12 +581,12 @@ bool tmConnect() {
   if (!s) { tmClient->disconnect(); return false; }
   tmCp = s->getCharacteristic(U16(0x2AD9));
   if (!tmCp) { tmClient->disconnect(); return false; }
-  tmCp->subscribe(false, cpNotify);
+  tmCp->subscribe(false, cpNotify);                       // ردود التحكم (indication)
   NimBLERemoteCharacteristic* c = s->getCharacteristic(U16(0x2ACD));
   if (c && c->canNotify()) c->subscribe(true, tmDataNotify);
   c = s->getCharacteristic(U16(0x2ADA));
   if (c && c->canNotify()) c->subscribe(true, tmStatusNotify);
-  if (!fmGot) {
+  if (!fmGot) {                                           // مواصفات المشاية مرة واحدة
     uint8_t f[8], sp[6], ic[6];
     bool a = readInto(s, 0x2ACC, f, 8), b = readInto(s, 0x2AD4, sp, 6), d = readInto(s, 0x2AD5, ic, 6);
     if (a) memcpy(fmFeatB, f, 8);
@@ -593,6 +613,7 @@ float tmMaxIncl()  { return (int16_t)(fmIncB[2] | (fmIncB[3] << 8)) * 0.1f; }
 float effMaxSpeed() { float v = tmMaxSpeed(); if (v < 1.0f) v = 20.0f; if (cfg.maxSpd > 0 && cfg.maxSpd < v) v = cfg.maxSpd; return v; }
 float effMaxIncl()  { float v = tmMaxIncl(); if (v < 0.5f) v = 15.0f; if (cfg.maxInc > 0 && cfg.maxInc < v) v = cfg.maxInc; return v; }
 
+// أقصى سرعة مسموحة حسب الحرارة: كاملة تحت التحذير، وتنخفض خطيًا إلى vmin عند الخطر
 float capSpeedFor(float temp, float warn, float hot, float vmax, float vmin, bool on) {
   if (!on || temp <= -50.0f || temp < warn) return vmax;
   if (hot <= warn || temp >= hot) return vmin < vmax ? vmin : vmax;
@@ -600,28 +621,28 @@ float capSpeedFor(float temp, float warn, float hot, float vmax, float vmin, boo
   float v = vmax - (vmax - vmin) * k;
   return v < vmin ? vmin : v;
 }
-
+// خطوة تسارع/تباطؤ محدودة (dt بالثواني)
 float shapeStep(float out, float target, float accel, float decel, float dt) {
   if (target > out) { if (accel <= 0) return target; float m = accel * dt; return (target - out) > m ? out + m : target; }
   if (decel <= 0) return target;
   float m = decel * dt;
   return (out - target) > m ? out - m : target;
 }
-
+// الوقت المتوقع (بالدقائق) لبلوغ حد معيّن من ميل منحنى الحرارة؛ -1 إن لم ترتفع الحرارة بوضوح
 float predictEta(const float* y, int n, float stepMin, float temp, float limit) {
   if (n < 24) return -1.0f;
   double sx = 0, sy = 0, sxx = 0, sxy = 0;
   for (int i = 0; i < n; i++) { double x = i * (double)stepMin; sx += x; sy += y[i]; sxx += x * x; sxy += x * y[i]; }
   double den = n * sxx - sx * sx;
   if (den <= 0) return -1.0f;
-  double slope = (n * sxy - sx * sy) / den;
+  double slope = (n * sxy - sx * sy) / den;           // درجة/دقيقة
   if (slope < 0.05) return -1.0f;
   double eta = (limit - temp) / slope;
   return (float)(eta < 0 ? 0 : eta);
 }
 
 // ---------- شكّل أوامر التطبيقات قبل تمريرها للمشاية ----------
-float reqSpeed = -1.0f, outSpeed = -1.0f, lastSentSpd = -1.0f;
+float reqSpeed = -1.0f, outSpeed = -1.0f, lastSentSpd = -1.0f;   // كم/س، -1 = لا شيء
 bool cdActive = false;
 uint32_t cdEnd = 0;
 bool speedFresh() { return (uint32_t)(millis() - tmSpeedMs) < 4000; }
@@ -635,7 +656,7 @@ void shaperReset() { reqSpeed = -1.0f; outSpeed = -1.0f; lastSentSpd = -1.0f; cd
 
 void handleFwd(const Fwd& f) {
   uint8_t op = f.d[0];
-  if (op == 0x02 && f.n >= 3) {
+  if (op == 0x02 && f.n >= 3) {                       // سرعة مستهدفة
     cdActive = false;
     float v = (f.d[1] | (f.d[2] << 8)) * 0.01f;
     float mx = effMaxSpeed(), mn = tmMinSpeed();
@@ -645,7 +666,7 @@ void handleFwd(const Fwd& f) {
     if (outSpeed < 0) outSpeed = speedFresh() ? tmSpeed : v;
     return;
   }
-  if (op == 0x03 && f.n >= 3) {
+  if (op == 0x03 && f.n >= 3) {                       // ميل مستهدف: يُمرَّر بعد تحديده بالحد
     float inc = (int16_t)(f.d[1] | (f.d[2] << 8)) * 0.1f;
     float mx = effMaxIncl();
     if (inc > mx) inc = mx;
@@ -654,15 +675,15 @@ void handleFwd(const Fwd& f) {
     sendRaw(b, 3);
     return;
   }
-  if (op == 0x07) {
+  if (op == 0x07) {                                   // بدء: السرعة تصعد تدريجيًا بعده
     cdActive = false; outSpeed = -1.0f; lastSentSpd = -1.0f;
     sendRaw(f.d, f.n);
     return;
   }
-  if (op == 0x08) {
+  if (op == 0x08) {                                   // إيقاف
     bool real = f.n >= 2 && f.d[1] == 0x01;
     if (real && cfg.cdMin > 0 && !cdActive && speedFresh() && tmSpeed >= 5.0f) {
-      cdActive = true; cdEnd = millis() + (uint32_t)cfg.cdMin * 60000UL;
+      cdActive = true; cdEnd = millis() + (uint32_t)cfg.cdMin * 60000UL;   // مشي بطيء ثم إيقاف؛ أمر إيقاف ثانٍ يوقف فورًا
       reqSpeed = 3.0f;
       if (outSpeed < 0) outSpeed = tmSpeed;
       return;
@@ -686,7 +707,7 @@ void shaperTick(uint32_t now) {
   if ((uint32_t)(now - last) < 500) return;
   float dt = (last == 0) ? 0.5f : (now - last) / 1000.0f;
   last = now;
-  if (cdActive && (int32_t)(now - cdEnd) >= 0) {
+  if (cdActive && (int32_t)(now - cdEnd) >= 0) {      // انتهى المشي البطيء: أوقف
     shaperReset();
     uint8_t st[2] = {0x08, 0x01};
     sendRaw(st, 2);
@@ -705,6 +726,7 @@ void shaperTick(uint32_t now) {
   }
 }
 
+// قرار الحماية: تخفيض السرعة 1 كم/س كل 1.5 ثانية حتى 3 كم/س ثم إيقاف، وإيقاف فوري عند الخطر الشديد
 size_t lockDecide(LockState& s, uint32_t now, bool fresh, float cur, bool hard, uint8_t out[3]) {
   uint32_t gap = s.stopped ? 3000 : 1500;
   if ((uint32_t)(now - s.last) < gap) return 0;
@@ -722,10 +744,18 @@ size_t lockDecide(LockState& s, uint32_t now, bool fresh, float cur, bool hard, 
   return 3;
 }
 
+// متى يجب أن تكون اللوحة متصلة بالمشاية؟
+// الحماية تعمل دائمًا. زر "ربط المشاية" يعمل ما دام تطبيق ما متصلًا باللوحة (يسقط بعد 20 ثانية من غياب كل التطبيقات).
+// تطبيق مثل Kinomap/Zwift يُبقي الاتصال ما دام أرسل أمرًا خلال آخر 20 ثانية وبعد آخر ضغط على "فصل".
+// وتستعد اللوحة أيضًا عندما تقترب الحرارة من حد التحذير (بعد دقيقة من الفصل).
 #define IDLE_MS 20000UL
+// إصلاح: ما دام الحزام يدور وقد أمره تطبيق بعد آخر "فصل" يبقى الاتصال قائمًا؛ فبرامج التطبيق تُرسل أوامر
+// قليلة (عند تغيّر المرحلة فقط)، وقطع الاتصال بعد 20 ثانية من الصمت كان يوقف المشاية أثناء البرنامج.
 bool wantLink(uint32_t now, bool lock, bool manual, uint32_t ftmsAct, uint32_t dOff, float temp, float warn, bool gone, bool moving) {
   if (lock) return true;
+  // أمان وحصانة الاتصال: ما دام السير يدور أو المحرك يستهلك تياراً، يُمنع قطع الاتصال إطلاقاً
   if (moving) return true;
+  // إذا لم يكن الهاتف متصلًا باللوحة أصلاً، لا تقم بالمسح إطلاقاً لكي يظل راديو البلوتوث حراً ويستقبل اتصال الهاتف فوراً
   if (!gServer || gServer->getConnectedCount() == 0) return false;
   if (manual && !gone) return true;
   bool appSince = ftmsAct && (!dOff || (int32_t)(ftmsAct - dOff) > 0);
@@ -755,7 +785,7 @@ void guardTask(void*) {
           size_t n = lockDecide(ls, now, fresh, tmSpeed, hardStop, cmd);
           if (n && tmCp) { ensureCtrl(); tmCp->writeValue(cmd, n, false); }
         }
-        fwdT = fwdH;
+        fwdT = fwdH;                                  // أوامر التطبيقات مرفوضة أثناء الحماية
         shaperReset();
       } else {
         ls = {0, false, 0};
@@ -774,7 +804,7 @@ void guardTask(void*) {
 }
 
 void bridgePump(uint32_t now) {
-  while (cpRT != cpRH) {
+  while (cpRT != cpRH) {                              // ردود أوامر Kinomap/Zwift
     fmCp->setValue(cpRep[cpRT], 3);
     fmCp->indicate();
     cpRT = (cpRT + 1) & 3;
@@ -788,36 +818,25 @@ void bridgePump(uint32_t now) {
   }
   portEXIT_CRITICAL(&pktMux);
 
-  if (nPkt > 0) {
+  if (nPkt > 0) {                                     // بيانات المشاية إلى التطبيقات
     fmData->setValue(bPkt, nPkt);
     fmData->notify();
     if ((uint32_t)(now - tmSpeedMs) < 4000) mhe.feedSpeed(now, tmSpeed, tmIncl);
-  } else {
-    // تغذية MotorHealth بالسرعة التقديرية المشتقة من تيار المحرك عند عدم اتصال البلوتوث
-    static uint32_t lastFallbackFeed = 0;
-    if ((uint32_t)(now - tmSpeedMs) >= 4000 && (uint32_t)(now - lastFallbackFeed) >= 2000) {
-      lastFallbackFeed = now;
-      float curA = dspEngine.getMetrics().currentA;
-      if (curA >= 0.65f) mhe.feedSpeed(now, 4.0f, 0.0f);
-      else mhe.feedSpeed(now, 0.0f, 0.0f);
-    }
-    if (!tmLinked && ftmsLastAct && (uint32_t)(now - ftmsLastAct) < 60000) {
-      static uint32_t lastZero = 0;
-      if ((uint32_t)(now - lastZero) >= 1000) {
-        static const uint8_t z[4] = {0, 0, 0, 0};
-        if (tmPktLen > 0 && (uint32_t)(now - tmSpeedMs) < 60000UL) {
-          uint8_t b[32]; uint8_t n = tmPktLen;
-          memcpy(b, (const void*)tmPkt, n);
-          fmData->setValue(b, n);
-        } else {
-          fmData->setValue(z, 4);
-        }
-        fmData->notify();
-        lastZero = now;
+  } else if (!tmLinked && ftmsLastAct && (uint32_t)(now - ftmsLastAct) < 60000) {
+    static uint32_t lastZero = 0;                     // قبل اكتمال الاتصال: آخر قراءة معروفة (أو صفر)
+    if ((uint32_t)(now - lastZero) >= 1000) {
+      static const uint8_t z[4] = {0, 0, 0, 0};
+      if (tmPktLen > 0 && (uint32_t)(now - tmSpeedMs) < 60000UL) {
+        uint8_t b[32]; uint8_t n = tmPktLen;
+        memcpy(b, (const void*)tmPkt, n);
+        fmData->setValue(b, n);
+      } else {
+        fmData->setValue(z, 4);
       }
+      fmData->notify();
+      lastZero = now;
     }
   }
-
   uint8_t bSt[16]; uint8_t nSt = 0;
   portENTER_CRITICAL(&pktMux);
   if (tmStNew) {
@@ -830,6 +849,7 @@ void bridgePump(uint32_t now) {
     fmStatus->setValue(bSt, nSt);
     fmStatus->notify();
 
+    // فك شفرة أسباب توقف المشاية الحقيقية من كونسول Kettler عبر بروتوكول FTMS
     uint8_t op = bSt[0];
     if (op == 0x02 || op == 0x01) {
       setStopReason(STOP_USER_CONSOLE, "CONSOLE_STOP");
@@ -839,7 +859,7 @@ void bridgePump(uint32_t now) {
       setStopReason(STOP_BLE_TIMEOUT, "FTMS_CTRL_LOST");
     }
   }
-  if (fmGot) {
+  if (fmGot) {                                        // حفظ مواصفات المشاية وإظهارها للتطبيقات
     fmGot = false;
     fmFeat->setValue(fmFeatB, 8); fmSpd->setValue(fmSpdB, 6); fmInc->setValue(fmIncB, 6);
     uint8_t blob[20];
@@ -856,7 +876,7 @@ int8_t lastSentLock = -1;
 
 void onTemp(uint32_t now, float t) {
   char b[32];
-  if (t <= -100.0f) {
+  if (t <= -100.0f) {                 // الحساس غير متصل (-127)
     Serial.println("DS18B20 not found");
     static uint8_t discCnt = 0;
     bool isRunning = (dspEngine.getMetrics().currentA > 0.4f) || (tmSpeed > 0.3f);
@@ -874,7 +894,7 @@ void onTemp(uint32_t now, float t) {
     if (connected) sendLine("Temp: ERR\n");
     return;
   }
-  if (t == 85.0f) return;
+  if (t == 85.0f) return;             // قيمة التشغيل الأولى
 
   if (latchedFaults & FAULT_TEMP_DISC) {
     latchedFaults &= ~FAULT_TEMP_DISC;
@@ -882,7 +902,7 @@ void onTemp(uint32_t now, float t) {
     Serial.println("[SAFETY] Temp sensor recovered and verified.");
   }
 
-  // فلتر القفزات الحرارية المضاد للتجميد (Anti-Freeze Glitch Counter)
+  // فلتر نبضات الحرارة الكاذبة مع عداد رفض مضاد للتجميد (Anti-Freeze Glitch Filter - Argon Point 7)
   static float lastValidTemp = -100.0f;
   static uint8_t glitchRejectCnt = 0;
   if (lastValidTemp > -50.0f && fabsf(t - lastValidTemp) > 4.5f) {
@@ -898,6 +918,7 @@ void onTemp(uint32_t now, float t) {
   lastTemp = t;
   mhe.feedTemp(now, t);
 
+  // 4 قراءات متتالية مؤكدة فوق حد الخطر لتفعيل الحماية
   if (t >= hotC) {
     if (hotCnt < 255) hotCnt++;
     if (hotCnt >= 4) {
@@ -909,6 +930,7 @@ void onTemp(uint32_t now, float t) {
     hotCnt = 0;
   }
 
+  // تأكيد حد الإيقاف الفوري (3 قراءات متتالية فوق hotC + 5)
   static uint8_t hardCnt = 0;
   if (t >= hotC + 5.0f) {
     if (hardCnt < 255) hardCnt++;
@@ -925,6 +947,7 @@ void onTemp(uint32_t now, float t) {
     }
   }
 
+  // نزول الحرارة تحت حد التحذير يمسح فقط عطل الحرارة، ولا يمسح إطلاقاً عطل انحشار التيار!
   if (t < effWarn()) {
     if (latchedFaults & (FAULT_TEMP_HOT | FAULT_TEMP_CRIT)) {
       latchedFaults &= ~(FAULT_TEMP_HOT | FAULT_TEMP_CRIT);
@@ -937,6 +960,7 @@ void onTemp(uint32_t now, float t) {
   if (connected) sendLine(b);
 }
 
+// إرسال سطر طويل بحزم 20 بايت (آمن مع أي MTU)
 void sendLong(const char* s) {
   size_t n = strlen(s);
   for (size_t p = 0; p < n; p += 20) {
@@ -987,11 +1011,7 @@ void dspLoad() {
   if (storedLen > 0) {
     size_t toRead = storedLen < sizeof(t) ? storedLen : sizeof(t);
     dspPrefs.getBytes("c", &t, toRead);
-    // ترقية تلقائية لقيمة kurtosisThresh القديمة (18.0 أو 6.5) إلى القيمة المحسنة (7.5)
-    if (fabsf(t.kurtosisThresh - 18.0f) < 0.2f || fabsf(t.kurtosisThresh - 6.5f) < 0.1f) {
-      t.kurtosisThresh = 7.5f;
-      dspPrefs.putBytes("c", &t, sizeof(t));
-    }
+    if (fabsf(t.kurtosisThresh - 18.0f) < 0.05f) t.kurtosisThresh = 7.5f; // ترقية تلقائية للعتبة بعد فلتر الـ PWM الجديد
     dspEngine.setConfig(t);
   }
   float savedKWh = dspPrefs.getFloat("ekwh", 0.0f);
@@ -1001,11 +1021,11 @@ void dspLoad() {
 void dspSend() {
   char b[190];
   auto c = dspEngine.getConfig();
-  snprintf(b, sizeof b, "IPC:F=%.1f,L=%.1f,D=%u,K=%.1f,W=%.1f,C=%.1f,B=%.1f,T=%.2f,S=%.1f,V=%.1f,BL=%.2f,AE=%u,IJ=%.1f,NC=%.2f,ZT=%u\n",
+  snprintf(b, sizeof b, "IPC:F=%.1f,L=%.1f,D=%u,K=%.1f,W=%.1f,C=%.1f,B=%.1f,T=%.2f,S=%.1f,V=%.1f,BL=%.2f,AE=%u,IJ=%.1f,NC=%.2f,ZT=%u,WK=%.1f\n",
            c.ratedCurrentA, c.stallLimitA, (unsigned)c.stallDelayMs,
            c.kurtosisThresh, c.cusumWarnScore, c.cusumCritScore,
            c.emptyBeltWarnA, c.stepDeltaA, c.sensMvPerA, c.nominalBusV, c.calibratedBaselineA,
-           (unsigned)c.autoSensOn, c.inertiaDelayS, c.inclineCompA, (unsigned)c.zeroTrackingOn);
+           (unsigned)c.autoSensOn, c.inertiaDelayS, c.inclineCompA, (unsigned)c.zeroTrackingOn, c.weightKgPerA);
   sendLong(b);
 }
 void dspPump() {
@@ -1022,6 +1042,8 @@ void dspPump() {
   }
 }
 
+
+// تنبؤ: ميل الحرارة آخر 6 دقائق (عينة كل 10 ثوانٍ) -> متى نبلغ حد التحذير أو الخطر
 float predBuf[36]; int predN = 0; int predShown = -2; float capShown = -1.0f;
 void predictPump(uint32_t now) {
   static uint32_t lastS = 0, lastRep = 0;
@@ -1055,13 +1077,13 @@ void capPump() {
 
 void sendStatus() {
   static const char* names[] = {"OFF", "SCAN", "ON", "FAIL"};
-  char b[64];
+  char b[32];
   uint8_t st = guardState;
   snprintf(b, sizeof b, "ST:%s\nLK:%d\nDIAG:%d,%s\n", names[st > 3 ? 0 : st], lockOn ? 1 : 0, lastStopCode, lastStopReason);
   sendLine(b);
   lastSentState = st;
   lastSentLock = lockOn ? 1 : 0;
-  capShown = -1.0f; predShown = -2;
+  capShown = -1.0f; predShown = -2;          // أعد إرسال حالة التحديد والتنبؤ بعد كل اتصال
 }
 
 void setup() {
@@ -1129,14 +1151,15 @@ void setup() {
   fsvc->start();
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  // فصل الإعلان الرئيسي عن الاستجابة لتفادي تجاوز حد 31 بايت
   NimBLEAdvertisementData advData;
   advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
-  advData.setCompleteServices(U16(0x1826));
-  advData.setName(DEV_NAME);
+  advData.setCompleteServices(U16(0x1826));              // FTMS للتطبيقات الرياضية
+  advData.setName(DEV_NAME);                            // اسم الجهاز
   adv->setAdvertisementData(advData);
 
   NimBLEAdvertisementData scanData;
-  scanData.setCompleteServices(NimBLEUUID(NUS_SVC));
+  scanData.setCompleteServices(NimBLEUUID(NUS_SVC));    // خدمة UART لتطبيق الويب
   adv->setScanResponseData(scanData);
   adv->start();
 
@@ -1155,7 +1178,7 @@ void loop() {
   if (pending && now - tReq >= 800)   { pending = false; onTemp(now, ds.getTempCByIndex(0)); }
 
   static uint32_t lastChk = 0;
-  if ((uint32_t)(now - lastChk) >= 1000) {
+  if ((uint32_t)(now - lastChk) >= 1000) {            // فحص اشتراك تطبيق الويب في خدمة الحرارة
     lastChk = now;
     if (txChar) connected = (txChar->getSubscribedCount() > 0);
   }
@@ -1177,12 +1200,10 @@ void loop() {
   if (connected && (uint32_t)(now - lastCurMs) >= 500) {
     lastCurMs = now;
     auto m = dspEngine.getMetrics();
-    char b[192];
-    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f,WT=%.1f,CAD=%u,ARC=%.0f,TN=%u,BG=%u,EC=%.1f,FT=%u,SO=%d,KW=%.3f\n",
+    char b[128];
+    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f,WT=%.1f\n",
              m.currentA, m.kurtosis, (int)m.brushHealth, m.powerWatts,
-             (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct, m.estimatedWeightKg,
-             (unsigned)m.cadenceSpm, m.arcingScore, (unsigned)m.beltTensionStatus, (unsigned)m.bearingStatus,
-             m.runningEconomyWhPerKm, (unsigned)m.fatigueState, m.stepOffAlert ? 1 : 0, m.energyKWh);
+             (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct, m.estimatedWeightKg);
     sendLine(b);
     if (m.stallAlert) {
       latchedFaults |= FAULT_STALL_LATCH;
@@ -1190,6 +1211,7 @@ void loop() {
       setStopReason(STOP_STALL_OVERLOAD, "STALL_OVERLOAD");
     }
 
+    // إزالة قفل الانحشار بأمان فقط بعد توقف السير التام لـ 3.5 ثانية (Safety Interlock)
     if (latchedFaults & FAULT_STALL_LATCH) {
       if (tmSpeed <= 0.05f && m.currentA < 0.25f && (now - lastStopMs) > 3500) {
         latchedFaults &= ~FAULT_STALL_LATCH;
@@ -1198,19 +1220,13 @@ void loop() {
       }
     }
   }
-
-  // حفظ آمن في ذاكرة NVS يحمي الفلاش من التآكل: يحفظ فقط عند توقف السير أو كل 15 دقيقة إذا تغيرت القيم فعلياً
   static uint32_t lastCounterSaveMs = 0;
-  static uint32_t lastSavedSteps = 0;
   static bool wasMoving = false;
-  bool isMoving = moving;
-  uint32_t curSteps = dspEngine.getCumulativeSteps();
-
-  if ((wasMoving && !isMoving) || ((uint32_t)(now - lastCounterSaveMs) >= 900000UL && curSteps != lastSavedSteps)) {
+  bool isMoving = (tmSpeed > 0.3f);
+  if ((uint32_t)(now - lastCounterSaveMs) >= 60000 || (wasMoving && !isMoving)) {
     lastCounterSaveMs = now;
-    lastSavedSteps = curSteps;
     dspPrefs.putFloat("ekwh", dspEngine.getCumulativeEnergyKWh());
-    dspPrefs.putUInt("steps", curSteps);
+    dspPrefs.putUInt("steps", dspEngine.getCumulativeSteps());
   }
   wasMoving = isMoving;
 
