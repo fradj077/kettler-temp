@@ -987,8 +987,8 @@ void dspLoad() {
   if (storedLen > 0) {
     size_t toRead = storedLen < sizeof(t) ? storedLen : sizeof(t);
     dspPrefs.getBytes("c", &t, toRead);
-    // ترقية تلقائية لقيمة kurtosisThresh القديمة (18.0) إلى القيمة الجديدة المحسنة (7.5)
-    if (fabsf(t.kurtosisThresh - 18.0f) < 0.2f) {
+    // ترقية تلقائية لقيمة kurtosisThresh القديمة (18.0 أو 6.5) إلى القيمة المحسنة (7.5)
+    if (fabsf(t.kurtosisThresh - 18.0f) < 0.2f || fabsf(t.kurtosisThresh - 6.5f) < 0.1f) {
       t.kurtosisThresh = 7.5f;
       dspPrefs.putBytes("c", &t, sizeof(t));
     }
@@ -1177,11 +1177,12 @@ void loop() {
   if (connected && (uint32_t)(now - lastCurMs) >= 500) {
     lastCurMs = now;
     auto m = dspEngine.getMetrics();
-    char b[160];
-    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f,WT=%.1f,CAD=%u,ARC=%.0f,TN=%u,BR=%u\n",
+    char b[192];
+    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f,WT=%.1f,CAD=%u,ARC=%.0f,TN=%u,BG=%u,EC=%.1f,FT=%u,SO=%d,KW=%.3f\n",
              m.currentA, m.kurtosis, (int)m.brushHealth, m.powerWatts,
              (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct, m.estimatedWeightKg,
-             (unsigned)m.cadenceSpm, m.arcingScore, (unsigned)m.beltTensionStatus, (unsigned)m.bearingStatus);
+             (unsigned)m.cadenceSpm, m.arcingScore, (unsigned)m.beltTensionStatus, (unsigned)m.bearingStatus,
+             m.runningEconomyWhPerKm, (unsigned)m.fatigueState, m.stepOffAlert ? 1 : 0, m.energyKWh);
     sendLine(b);
     if (m.stallAlert) {
       latchedFaults |= FAULT_STALL_LATCH;
