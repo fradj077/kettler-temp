@@ -1,14 +1,5 @@
-// MotorHealth.h  -  motor temperature health analysis that runs ON the ESP32.
-//
-// Header only, no Arduino dependency (so it can be tested on a PC).
-// It watches temperature + treadmill speed, detects training sessions, measures
-//   * how fast the motor heats up at a given speed/incline  (deg C per minute)
-//   * how fast it cools down after the run                  (thermal time constant)
-// compares them with a baseline learned from the first healthy sessions, and reports
-//   learning / ok / watch / check.
-//
-// The phone only asks for results with short text commands (see command()).
-// All answers are text lines that start with "MH:" and end with '\n'.
+// MotorHealth.h - Motor temperature health analysis that runs ON the ESP32.
+// Version: Argon-Spark Unified Edition (120-min Cold Soak & Ambient Tracking)
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -35,7 +26,7 @@ static const int NBASE = 5;          // sessions that make the baseline
 static const int NREC = 3;           // recent sessions compared with it
 static const int HIST = 40;          // sessions kept
 static const int16_t NONE = -32768;
-static const uint32_t COLD_AFTER_S = 45 * 60;   // idle time that makes the motor "cold"
+static const uint32_t COLD_AFTER_S = 120 * 60;  // 120 min (2 hours) ensures true thermal equilibrium of heavy PMDC rotor
 
 struct Session {          // 20 bytes
   uint32_t epoch;         // start time, 0 = unknown
@@ -75,7 +66,7 @@ struct Status {
 
 typedef bool (*LoadFn)(void*, size_t);
 typedef void (*SaveFn)(const void*, size_t);
-typedef void (*SendFn)(const char*, size_t);   // one BLE notification
+typedef void (*SendFn)(const char*, size_t);
 typedef void (*SleepFn)(uint32_t);
 
 inline int16_t med(const int16_t* a, int n) {
@@ -118,11 +109,15 @@ class Engine {
   }
   void setChunk(size_t n) { chunkSz = n < 5 ? 5 : n; }
 
-  // ---------- inputs (call from loop()) ----------
   void setTime(uint32_t epoch, uint32_t now) { epochBase = epoch; msBase = now; timeSet = true; }
   void feedTemp(uint32_t now, float t) {
     if (isnan(t) || t < -40.f || t > 200.f) return;
     lastT = t; lastTMs = now; haveT = true;
+    // Track minimum ambient reference when motor is idle
+    if (stt == IDLE && (!haveAmbient || t < ambientRefT)) {
+      ambientRefT = t;
+      haveAmbient = true;
+    }
     sampler(now);
   }
   void feedSpeed(uint32_t now, float kmh, float incl) {
@@ -136,7 +131,6 @@ class Engine {
     pump(now);
   }
 
-  // Safe to call from the BLE write callback (other task): it only copies the text.
   bool pushCommand(const char* s) {
     if (!s || s[0] != 'M') return false;
     uint8_t h = inHead, n = (uint8_t)((h + 1) % IN_Q);
@@ -147,7 +141,6 @@ class Engine {
     return true;
   }
 
-  // ---------- status ----------
   Status status() const {
     Status r; memset(&r, 0, sizeof r);
     int level = 0;
@@ -171,15 +164,6 @@ class Engine {
   }
   int state() const { return (int)stt; }
 
-  // ---------- commands (text, one per line) ----------
-  //  MS          status summary
-  //  ML<n>       last n sessions (newest first, n<=20)
-  //  MB          baselines per bin
-  //  MT<epoch>   set the clock
-  //  MV<s10>,<i10>  live speed x10 and incline x10 from the phone
-  //  MR          forget the baselines (history stays)
-  //  MX          clear history + baselines (hour counters stay)
-  //  MM          mark maintenance done (resets "hours since maintenance")
   void command(const char* line, uint32_t now) {
     if (!line || line[0] != 'M') return;
     char c = line[1];
@@ -239,7 +223,6 @@ class Engine {
     }
   }
 
-  // ---------- output queue (one whole line per notification burst, never interleaved) ----------
   void pump(uint32_t now) {
     if (!outLen || !txFn) return;
     if ((int32_t)(now - lastPump) < 25) return;
@@ -269,6 +252,7 @@ class Engine {
 
   bool timeSet = false; uint32_t epochBase = 0, msBase = 0;
   float lastT = 0, lastS = 0, lastI = 0; uint32_t lastTMs = 0, lastSMs = 0; bool haveT = false, haveS = false;
+  float ambientRefT = 25.0f; bool haveAmbient = false;
   bool sampStarted = false; uint32_t nextSample = 0;
 
   int stt = IDLE;
@@ -279,7 +263,7 @@ class Engine {
   uint32_t runTicks = 0; float sumSpeed = 0; float startT = 0, peakT = 0, lastRunT = 0;
   uint32_t runStartEpoch = 0; bool cold = false; bool incomplete = false;
   bool haveEndMs = false; uint32_t lastEndMs = 0;
-  int curIdx = -1;   // history slot of the session whose cool-down is being measured
+  int curIdx = -1;
 
   void wipe(bool full) {
     memset(&st, 0, sizeof st);
@@ -302,21 +286,21 @@ class Engine {
 
   void sampler(uint32_t now) {
     if (!sampStarted) { nextSample = now + SAMPLE_MS; sampStarted = true; return; }
-    if ((int32_t)(now - nextSample) > 60000) nextSample = now;   // after a long stall do not replay history
+    if ((int32_t)(now - nextSample) > 60000) nextSample = now;
     while ((int32_t)(now - nextSample) >= 0) { tick(nextSample); nextSample += SAMPLE_MS; }
   }
 
   bool computeCold(uint32_t now) const {
     if (haveEndMs) return (uint32_t)(now - lastEndMs) / 1000u >= COLD_AFTER_S;
     if (timeSet && st.lastEnd > 0) { uint32_t e = epochAt(now); return e > st.lastEnd && e - st.lastEnd >= COLD_AFTER_S; }
-    // unknown idle time: compare with the coldest start seen before
-    float minCold = 1e9f; bool any = false;
+    float minCold = haveAmbient ? ambientRefT : 1e9f;
+    bool any = haveAmbient;
     int have = st.count < HIST ? st.count : HIST;
     for (int i = 0; i < have; i++) {
       const Session& s = st.hist[i];
       if ((s.flags & 1) && s.start100 != NONE) { float v = s.start100 / 100.f; if (v < minCold) minCold = v; any = true; }
     }
-    return !any || startT <= minCold + 3.0f;
+    return !any || startT <= minCold + 2.5f;
   }
 
   void tick(uint32_t tm) {
@@ -343,7 +327,6 @@ class Engine {
       return;
     }
 
-    // ---- RUN ----
     if (tOk && t > peakT) peakT = t;
     if (running) {
       stopCnt = 0; coolN = 0; unkCnt = 0;
@@ -381,10 +364,10 @@ class Engine {
     uint32_t t0 = tm - (uint32_t)(earlyN ? earlyN - 1 : 0) * SAMPLE_MS;
     runStartEpoch = epochAt(t0);
     cold = computeCold(t0);
+    if (cold) { ambientRefT = startT; haveAmbient = true; }
     earlyBad = false; curIdx = -1;
   }
 
-  // first stable plateau after the first minute -> heating rate
   bool heatWindow(float& slope, int& sb, int& ib) const {
     if (earlyBad) return false;
     int i = SKIP_N;
@@ -438,7 +421,6 @@ class Engine {
     st.hist[slot] = r; st.head = (uint16_t)((st.head + 1) % HIST); if (st.count < 65535) st.count++;
     st.totalSec += sec;
     haveEndMs = true;
-    // the run really ended STOP_N ticks ago
     lastEndMs = tm - (uint32_t)(incompleteEnd ? 0 : STOP_N) * SAMPLE_MS;
     uint32_t e = epochAt(lastEndMs); if (e) st.lastEnd = e;
     save();
@@ -450,8 +432,9 @@ class Engine {
   void finishCool() {
     if (curIdx >= 0 && coolN >= 60) {
       Session& r = st.hist[curIdx];
-      int span = coolN >= 120 ? 120 : 60;                    // 10 or 5 minutes
-      float excess = lastRunT - startT;
+      int span = coolN >= 120 ? 120 : 60;
+      float refAmb = (haveAmbient && ambientRefT < startT) ? ambientRefT : startT;
+      float excess = lastRunT - refAmb;
       float drop = lastRunT - cT[span - 1] / 100.f;
       if ((r.flags & 1) && excess >= 5.f) {
         float frac = drop / excess;
