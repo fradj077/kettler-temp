@@ -47,6 +47,14 @@
 // الأنواع هنا في الأعلى: مترجم Arduino يولّد تعريفات الدوال تلقائيًا قبل أول دالة
 struct Fwd { uint8_t n; uint8_t d[10]; uint32_t ms; };
 struct LockState { uint32_t last; bool stopped; float lastTarget; };
+
+// تصريحات مسبقة لضمان الترجمة القياسية في مترجم C++ و Arduino CLI
+void sendLine(const char* s);
+void sendLong(const char* s);
+void dspSave();
+void dspSend();
+void sendStatus();
+
 // إعدادات تُضبط من التطبيق وتُحفظ في ذاكرة اللوحة
 struct Cfg {
   float maxSpd;     // أقصى سرعة مسموحة كم/س (0 = حد المشاية نفسها)
@@ -129,6 +137,9 @@ void setStopReason(uint8_t code, const char* reason) {
 
 volatile uint8_t latchedFaults = FAULT_NONE;
 
+volatile bool lockOn = false;        // حماية الحرارة فعّالة
+volatile bool hardStop = false;      // الحرارة فوق الخطر بفارق كبير: إيقاف فوري
+
 inline void updateFaultFlags() {
   lockOn = (latchedFaults != FAULT_NONE);
   hardStop = (latchedFaults & (FAULT_STALL_LATCH | FAULT_TEMP_CRIT)) != 0;
@@ -137,8 +148,6 @@ inline void updateFaultFlags() {
 // ---------- حدود الحرارة ----------
 float warnC = 60.0f, hotC = 80.0f;
 volatile float pendW = 0, pendH = 0;
-volatile bool lockOn = false;        // حماية الحرارة فعّالة
-volatile bool hardStop = false;      // الحرارة فوق الخطر بفارق كبير: إيقاف فوري
 volatile bool manualLink = false;    // زر "ربط المشاية" في التطبيق
 volatile uint32_t dOffAt = 0;        // لحظة ضغط "فصل": تُلغي أسباب الاتصال الضعيفة بعدها
 volatile float lastTemp = -100.0f;
@@ -216,7 +225,7 @@ void handleLine(const char* l) {
     auto c = dspEngine.getConfig();
     switch (l[1]) {
       case 'F': c.ratedCurrentA = constrain(v, 5.0f, 25.0f); break;
-      case 'L': c.stallLimitA   = constrain(v, 8.0f, 25.0f); break;
+      case 'L': c.stallLimitA   = constrain(v, 2.0f, 15.0f); break;
       case 'D': c.stallDelayMs  = (uint16_t)constrain(v, 100.0f, 1500.0f); break;
       case 'K': c.kurtosisThresh = constrain(v, 4.0f, 30.0f); break;
       case 'W': c.cusumWarnScore = constrain(v, 5.0f, 50.0f); break;
@@ -1201,9 +1210,9 @@ void loop() {
     lastCurMs = now;
     auto m = dspEngine.getMetrics();
     char b[128];
-    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f,WT=%.1f\n",
+    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f\n",
              m.currentA, m.kurtosis, (int)m.brushHealth, m.powerWatts,
-             (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct, m.estimatedWeightKg);
+             (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct);
     sendLine(b);
     if (m.stallAlert) {
       latchedFaults |= FAULT_STALL_LATCH;

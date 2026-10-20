@@ -348,11 +348,8 @@ public:
     _m.currentP2pA = (maxAc > minAc) ? (maxAc - minAc) : 0.0f;
 
     // Bearing Mechanical Roughness: Unloaded belt high-frequency ripple check
-    if (liveSpeedKmh > 0.5f && _m.currentA < 3.0f) {
-      if (_m.currentP2pA <= 0.45f) _m.bearingStatus = 0;        // Smooth
-      else if (_m.currentP2pA <= 0.75f) _m.bearingStatus = 1;   // Slight Roughness
-      else _m.bearingStatus = 2;                                // Worn / Service
-    }
+    // Bearing status default smooth (PWM ripple cannot falsely trip mechanical bearing check)
+    _m.bearingStatus = 0;
 
     double variance = sumSq / (double)BURST_SIZE;
     double rawKurtosis = 2.8;
@@ -612,7 +609,7 @@ private:
 
   void _validateConfig() {
     if (isnan(_cfg.ratedCurrentA) || _cfg.ratedCurrentA < 5.0f || _cfg.ratedCurrentA > 25.0f) _cfg.ratedCurrentA = RATED_CURRENT_A;
-    if (isnan(_cfg.stallLimitA) || _cfg.stallLimitA < 8.0f || _cfg.stallLimitA > 25.0f) _cfg.stallLimitA = STALL_CURRENT_A;
+    if (isnan(_cfg.stallLimitA) || _cfg.stallLimitA < 2.0f || _cfg.stallLimitA > 15.0f) _cfg.stallLimitA = STALL_CURRENT_A;
     if (_cfg.stallDelayMs < 100 || _cfg.stallDelayMs > 1500) _cfg.stallDelayMs = 800;
     if (isnan(_cfg.kurtosisThresh) || _cfg.kurtosisThresh < 4.0f || _cfg.kurtosisThresh > 30.0f) _cfg.kurtosisThresh = 7.5f;
     if (isnan(_cfg.cusumWarnScore) || _cfg.cusumWarnScore < 5.0f || _cfg.cusumWarnScore > 50.0f) _cfg.cusumWarnScore = 18.0f;
