@@ -143,7 +143,7 @@ void mhTx(const char* d, size_t n) {
 void sendLine(const char* s) { mhTx(s, strlen(s)); }
 
 // ---------- استقبال أوامر تطبيق الويب ----------
-char lineBuf[48];
+char lineBuf[128];  // was 48: BKR restore line can reach ~50 chars and was silently dropped
 size_t lineLen = 0;
 void handleLine(const char* l) {
   if (l[0] == 'I' && l[1] == 'Z') { dspEngine.calibrateZero(200); return; }
