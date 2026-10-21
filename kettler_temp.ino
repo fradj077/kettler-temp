@@ -116,7 +116,9 @@ volatile uint8_t lastStopCode = STOP_NONE;
 volatile uint32_t lastStopMs = 0;
 char lastStopReason[48] = "NORMAL";
 
-// ---------- سجل آخر 5 أخطاء للأمان المحفوظة في فلاش NVS (v33) ----------
+volatile float lastTemp = -100.0f;
+
+// ---------- سجل آخر 5 أخطاء للأمان المحفوظة في فلاش NVS (v34) ----------
 struct FaultRecord {
   uint8_t code;
   uint32_t timestampMs;
@@ -221,7 +223,7 @@ float warnC = 60.0f, hotC = 80.0f;
 volatile float pendW = 0, pendH = 0;
 volatile bool manualLink = false;    // زر "ربط المشاية" في التطبيق
 volatile uint32_t dOffAt = 0;        // لحظة ضغط "فصل": تُلغي أسباب الاتصال الضعيفة بعدها
-volatile float lastTemp = -100.0f;
+// lastTemp declared above
 uint8_t hotCnt = 0;
 float effWarn() { return warnC < hotC ? warnC : hotC - 5.0f; }
 
