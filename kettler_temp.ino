@@ -108,12 +108,82 @@ enum StopReasonCode : uint8_t {
   STOP_STALL_OVERLOAD = 4,   // حماية انحشار المحرك: تيار > 15A
   STOP_TEMP_GLITCH = 5,      // اهتزاز أو انقطاع سلك حساس الحرارة
   STOP_BLE_TIMEOUT = 6,      // مهلة أمان البلوتوث / فقدان الاتصال
-  STOP_MANUAL_APP = 7        // إيقاف من تطبيق الويب
+  STOP_MANUAL_APP = 7,       // إيقاف من تطبيق الويب
+  STOP_BRUSH_WEAR = 8        // تآكل وتفحم شديد في فحمات المحرك
 };
 
 volatile uint8_t lastStopCode = STOP_NONE;
 volatile uint32_t lastStopMs = 0;
 char lastStopReason[48] = "NORMAL";
+
+// ---------- سجل آخر 5 أخطاء للأمان المحفوظة في فلاش NVS (v33) ----------
+struct FaultRecord {
+  uint8_t code;
+  uint32_t timestampMs;
+  float currentA;
+  float tempC;
+  float speedKmh;
+};
+
+FaultRecord faultHistory[5];
+uint8_t faultCount = 0;
+Preferences errPrefs;
+
+void sendFaultHistory() {
+  if (!connected) return;
+  char b[256];
+  int len = snprintf(b, sizeof(b), "FLOG:CNT=%d", faultCount);
+  for (int i = 0; i < faultCount && i < 5; i++) {
+    uint32_t agoSec = (millis() - faultHistory[i].timestampMs) / 1000;
+    len += snprintf(b + len, sizeof(b) - len, "|%d=%d,%lu,%.1f,%.1f,%.1f",
+                    i, faultHistory[i].code, (unsigned long)agoSec,
+                    faultHistory[i].currentA, faultHistory[i].tempC, faultHistory[i].speedKmh);
+    if (len >= (int)sizeof(b) - 30) break;
+  }
+  b[len++] = '\n';
+  b[len] = 0;
+  sendLong(b);
+}
+
+void loadFaultHistory() {
+  errPrefs.begin("k_errs", false);
+  faultCount = errPrefs.getUChar("cnt", 0);
+  if (faultCount > 5) faultCount = 5;
+  if (faultCount > 0) {
+    errPrefs.getBytes("recs", faultHistory, sizeof(faultHistory));
+  }
+  Serial.printf("[NVS] Loaded %d fault records from NVS flash.\n", faultCount);
+}
+
+void saveFault(uint8_t code) {
+  if (code == STOP_NONE || code == STOP_USER_CONSOLE || code == STOP_MANUAL_APP) return;
+  if (faultCount > 0 && faultHistory[0].code == code && (millis() - faultHistory[0].timestampMs) < 4000) return;
+
+  for (int i = 4; i > 0; i--) {
+    faultHistory[i] = faultHistory[i - 1];
+  }
+  faultHistory[0].code = code;
+  faultHistory[0].timestampMs = millis();
+  auto m = dspEngine.getMetrics();
+  faultHistory[0].currentA = m.currentA;
+  faultHistory[0].tempC = lastTemp > -50.0f ? lastTemp : 25.0f;
+  faultHistory[0].speedKmh = tmSpeed;
+
+  if (faultCount < 5) faultCount++;
+  errPrefs.putUChar("cnt", faultCount);
+  errPrefs.putBytes("recs", faultHistory, sizeof(faultHistory));
+  Serial.printf("[NVS] Logged new safety fault: %d (Total in flash: %d)\n", code, faultCount);
+  sendFaultHistory();
+}
+
+void clearFaultHistory() {
+  faultCount = 0;
+  memset(faultHistory, 0, sizeof(faultHistory));
+  errPrefs.putUChar("cnt", 0);
+  errPrefs.remove("recs");
+  Serial.println("[NVS] Fault history cleared.");
+  sendFaultHistory();
+}
 
 void setStopReason(uint8_t code, const char* reason) {
   lastStopCode = code;
@@ -126,6 +196,7 @@ void setStopReason(uint8_t code, const char* reason) {
     snprintf(b, sizeof b, "DIAG:C=%d,R=%s\n", code, reason);
     sendLine(b);
   }
+  saveFault(code);
 }
 
 // ---------- سجل الأعطال المثبتة ومعمارية الأمان الصناعية (Latched Faults) ----------
@@ -169,6 +240,9 @@ void sendLine(const char* s) { mhTx(s, strlen(s)); }
 char lineBuf[48];
 size_t lineLen = 0;
 void handleLine(const char* l) {
+  if (l[0] == 'F' && l[1] == 'Q') { sendFaultHistory(); return; }
+  if (l[0] == 'F' && l[1] == 'C') { clearFaultHistory(); return; }
+  if (l[0] == 'C' && l[1] == 'L') { latchedFaults = FAULT_NONE; updateFaultFlags(); sendStatus(); Serial.println("[SAFETY] Faults cleared via command."); return; }
   if (l[0] == 'I' && l[1] == 'Z') { dspEngine.calibrateZero(200); return; }
   if (l[0] == 'I' && l[1] == 'S') { dspEngine.resetSteps(); return; }
   if (l[0] == 'I' && l[1] == 'A') { dspEngine.resetArcingScore(); return; }
@@ -311,7 +385,7 @@ class RxCb : public NimBLECharacteristicCallbacks {
 class TxCb : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc*, uint16_t sub) {
     connected = (sub != 0);
-    if (connected) { connMs = millis(); needStatus = true; lineLen = 0; }
+    if (connected) { connMs = millis(); needStatus = true; lineLen = 0; sendFaultHistory(); }
   }
 };
 class SrvCb : public NimBLEServerCallbacks {
@@ -1105,6 +1179,7 @@ void setup() {
 
   mhPrefs.begin("mh", false);
   mhe.begin(mhLoad, mhSave, mhTx, mhSleep, 20);
+  loadFaultHistory();
 
   limPrefs.begin("lim", false);
   warnC = limPrefs.getFloat("w", 60.0f);
@@ -1217,12 +1292,18 @@ void loop() {
     if (m.stallAlert) {
       latchedFaults |= FAULT_STALL_LATCH;
       updateFaultFlags();
-      setStopReason(STOP_STALL_OVERLOAD, "STALL_OVERLOAD");
+      if (m.brushHealth >= 1) {
+        setStopReason(STOP_BRUSH_WEAR, "BRUSH_ARCING_OVERLOAD");
+      } else {
+        setStopReason(STOP_STALL_OVERLOAD, "STALL_OVERLOAD");
+      }
+    } else if (m.brushHealth == 2 && tmSpeed >= 0.5f) {
+      setStopReason(STOP_BRUSH_WEAR, "SEVERE_BRUSH_ARCING");
     }
 
     // إزالة قفل الانحشار بأمان فقط بعد توقف السير التام لـ 3.5 ثانية (Safety Interlock)
     if (latchedFaults & FAULT_STALL_LATCH) {
-      if (tmSpeed <= 0.05f && m.currentA < 0.25f && (now - lastStopMs) > 3500) {
+      if (tmSpeed <= 0.05f && (now - lastStopMs) > 3500) {
         latchedFaults &= ~FAULT_STALL_LATCH;
         updateFaultFlags();
         Serial.println("[SAFETY] Stall fault latch cleared after safe belt stop.");
@@ -1232,6 +1313,11 @@ void loop() {
   static uint32_t lastCounterSaveMs = 0;
   static bool wasMoving = false;
   bool isMoving = (tmSpeed > 0.3f);
+  if (isMoving && (millis() - lastStopMs) > 5000 && lastStopCode != STOP_NONE && latchedFaults == FAULT_NONE) {
+    lastStopCode = STOP_NONE;
+    strncpy(lastStopReason, "NORMAL", sizeof(lastStopReason) - 1);
+    needStatus = true;
+  }
   if ((uint32_t)(now - lastCounterSaveMs) >= 60000 || (wasMoving && !isMoving)) {
     lastCounterSaveMs = now;
     dspPrefs.putFloat("ekwh", dspEngine.getCumulativeEnergyKWh());
