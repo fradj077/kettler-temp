@@ -79,7 +79,7 @@ public:
   static constexpr float RATED_CURRENT_A   = 10.0f;  // Continuous Rated Current (AMPS 10)
   static constexpr float RATED_HORSEPOWER  = 2.5f;   // 2.5 H.P. Continuous (CON)
   static constexpr float STALL_CURRENT_A   = 15.0f;  // 150% of Rated FLA (Trip limit)
-  static constexpr float DEFAULT_SENS_MV_A = 26.4f;  // ACS758-050B on 3.3V supply (~26.4 mV/A)
+  static constexpr float DEFAULT_SENS_MV_A = 24.0f;  // ACS758-050B on 3.3V supply (~26.4 mV/A)
 
   static DspConfig getDefaultConfig() {
     DspConfig c;
@@ -103,7 +103,7 @@ public:
   }
 
   MotorCurrentDSP()
-    : _pin(5), _zeroMv(1650.0f), _calibrated(false),
+    : _pin(5), _zeroMv(1500.0f), _calibrated(false),
       _arcingScore(0.0f), _brushState(0),
       _emptyBeltSampleCount(0), _emptyBeltSum(0.0f),
       _pendingLubricationCal(false),

@@ -118,7 +118,7 @@ char lastStopReason[48] = "NORMAL";
 
 volatile float lastTemp = -100.0f;
 
-// ---------- سجل آخر 5 أخطاء للأمان المحفوظة في فلاش NVS (v34) ----------
+// ---------- سجل آخر 5 أخطاء للأمان المحفوظة في فلاش NVS (v35) ----------
 struct FaultRecord {
   uint8_t code;
   uint32_t timestampMs;
@@ -136,7 +136,8 @@ void sendFaultHistory() {
   char b[256];
   int len = snprintf(b, sizeof(b), "FLOG:CNT=%d", faultCount);
   for (int i = 0; i < faultCount && i < 5; i++) {
-    uint32_t agoSec = (millis() - faultHistory[i].timestampMs) / 1000;
+    uint32_t nowMs = millis();
+    uint32_t agoSec = (nowMs >= faultHistory[i].timestampMs) ? (nowMs - faultHistory[i].timestampMs) / 1000 : 0;
     len += snprintf(b + len, sizeof(b) - len, "|%d=%d,%lu,%.1f,%.1f,%.1f",
                     i, faultHistory[i].code, (unsigned long)agoSec,
                     faultHistory[i].currentA, faultHistory[i].tempC, faultHistory[i].speedKmh);
@@ -245,7 +246,19 @@ void handleLine(const char* l) {
   if (l[0] == 'F' && l[1] == 'Q') { sendFaultHistory(); return; }
   if (l[0] == 'F' && l[1] == 'C') { clearFaultHistory(); return; }
   if (l[0] == 'C' && l[1] == 'L') { latchedFaults = FAULT_NONE; updateFaultFlags(); sendStatus(); Serial.println("[SAFETY] Faults cleared via command."); return; }
-  if (l[0] == 'I' && l[1] == 'Z') { dspEngine.calibrateZero(200); return; }
+  if ((l[0] == 'I' || l[0] == 'K') && l[1] == 'Z') {
+    dspEngine.calibrateZero(200);
+    dspDirty = true;
+    dspDirtyMs = millis();
+    auto m = dspEngine.getMetrics();
+    Serial.printf("[CALIB] Zero calibration complete. New V0 = %.1f mV\n", m.zeroVoltMv);
+    if (connected) {
+      char b[64];
+      snprintf(b, sizeof b, "IZ:OK=%.1f\n", m.zeroVoltMv);
+      sendLine(b);
+    }
+    return;
+  }
   if (l[0] == 'I' && l[1] == 'S') { dspEngine.resetSteps(); return; }
   if (l[0] == 'I' && l[1] == 'A') { dspEngine.resetArcingScore(); return; }
   if (l[0] == 'M') {
