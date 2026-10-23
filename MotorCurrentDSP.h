@@ -93,7 +93,7 @@ public:
     c.ratedCurrentA         = RATED_CURRENT_A;   // 10.0f
     c.stallLimitA           = STALL_CURRENT_A;   // 15.0f
     c.stallDelayMs          = 800;               // 300 ms
-    c.kurtosisThresh        = 7.5f;              // K > 6.5
+    c.kurtosisThresh        = 18.0f;             // عتبة الإنذار الحقيقي بعد استبعاد تقطيع PWM              // K > 6.5
     c.cusumWarnScore        = 18.0f;             // Score >= 18.0 -> Warning
     c.cusumCritScore        = 45.0f;             // Score >= 45.0 -> Critical
     c.emptyBeltWarnA        = 3.5f;              // Empty belt > 3.5A -> Needs silicone lubrication
@@ -221,18 +221,22 @@ public:
     // CRITICAL GUARD: Only track true micro-thermal drift (< 5.0 mV, approx < 0.2A).
     // If current is flowing (diff >= 5.0 mV), NEVER shift zero point!
     float driftDiff = fabsf(meanMv - _zeroMv);
-    if (_cfg.zeroTrackingOn != 0 && liveSpeedKmh <= 0.05f && driftDiff < 5.0f && meanMv >= 1100.0f && meanMv <= 2700.0f) {
-      _zeroMv = _zeroMv * 0.995f + meanMv * 0.005f;
+    // تتبع حراري ذكي وسريع لنقطة الصفر عند سكون السير (يعوض أي إزاحة حتى 75mV ~ 1.8A)
+    if (_cfg.zeroTrackingOn != 0 && liveSpeedKmh <= 0.05f && driftDiff < 75.0f && meanMv >= 1100.0f && meanMv <= 2700.0f) {
+      _zeroMv = _zeroMv * 0.95f + meanMv * 0.05f;
       _m.zeroVoltMv = _zeroMv;
       _updateActiveSensitivity();
     }
 
     // 2. Low-Frequency DC Current & Motor Load % Calculation
-    // Auto-Polarity: Uses fabsf(diffMv) so current is measured accurately regardless of
-    // whether the primary terminals (IP+ / IP-) are wired in forward or reverse direction.
     float diffMv = meanMv - _zeroMv;
     float instantA = fabsf(diffMv) / _effectiveSens();
-    if (instantA < 0.04f) instantA = 0.0f; // Noise deadband at idle
+    // إخماد حاسم وتصفير تام لأي تيار وهمي ناتج عن حرارة الشاحن طالما أن السير متوقف تماماً
+    if (liveSpeedKmh <= 0.05f && instantA < 1.45f) {
+      instantA = 0.0f;
+    } else if (instantA < 0.04f) {
+      instantA = 0.0f; // Noise deadband at idle
+    }
 
     _smoothedCurrentA = _smoothedCurrentA * 0.7f + instantA * 0.3f;
     _m.currentA = _smoothedCurrentA;
@@ -329,19 +333,33 @@ public:
       }
     }
 
-    // 6 & 7. High-Pass Local Moving Baseline + 2-Tap PWM Suppression & Kurtosis (Argon Point 2)
-    // يعزل موجة خطوة القدم والتسارع تماماً (fc ~ 115 Hz) ويكتم ضوضاء تقطيع الـ PWM قبل حساب التفرطح
+    // 6 & 7. Impulse Despiker + High-Pass Moving Baseline + 2-Tap PWM Suppression & Kurtosis
+    // يستبعد نبضات التقطيع الخاطفة المعزولة (120us) ثم يعزل موجة القدم والتسارع قبل حساب التفرطح
     float minAc = 1e9f, maxAc = -1e9f;
     float invSens = 1.0f / _effectiveSens();
-    float localMean = _rawMv[0];
     float prevHf = 0.0f;
     double sumSq = 0.0;
     double sumQuad = 0.0;
 
+    // Despiker Filter: استبعاد النبضات المفردة الخاطفة (Switching Notches) الناتجة عن درايفر المشاية
+    float cleanMv[BURST_SIZE];
+    cleanMv[0] = _rawMv[0];
+    cleanMv[BURST_SIZE - 1] = _rawMv[BURST_SIZE - 1];
+    for (size_t i = 1; i < BURST_SIZE - 1; i++) {
+      float dl = _rawMv[i] - _rawMv[i - 1];
+      float dr = _rawMv[i] - _rawMv[i + 1];
+      if ((dl > 30.0f && dr > 30.0f) || (dl < -30.0f && dr < -30.0f)) {
+        cleanMv[i] = 0.5f * (_rawMv[i - 1] + _rawMv[i + 1]);
+      } else {
+        cleanMv[i] = _rawMv[i];
+      }
+    }
+
+    float localMean = cleanMv[0];
     for (size_t i = 0; i < BURST_SIZE; i++) {
-      localMean = localMean * 0.92f + _rawMv[i] * 0.08f; // يتتبع موجة القدم ويتجاهل إبر الشرارة
-      float hfSample = (_rawMv[i] - localMean) * invSens;
-      _hp[i] = (i > 0) ? 0.5f * (hfSample + prevHf) : hfSample; // مرشح ثنائي النقاط لكتم ضوضاء الـ PWM
+      localMean = localMean * 0.92f + cleanMv[i] * 0.08f; // يتتبع موجة القدم البطيئة
+      float hfSample = (cleanMv[i] - localMean) * invSens;
+      _hp[i] = (i > 0) ? 0.5f * (hfSample + prevHf) : hfSample; // مرشح ثنائي النقاط لكتم التموج العالي
       prevHf = hfSample;
 
       if (_hp[i] < minAc) minAc = _hp[i];

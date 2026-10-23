@@ -1126,7 +1126,7 @@ void dspLoad() {
   if (storedLen > 0) {
     size_t toRead = storedLen < sizeof(t) ? storedLen : sizeof(t);
     dspPrefs.getBytes("c", &t, toRead);
-    if (fabsf(t.kurtosisThresh - 18.0f) < 0.05f) t.kurtosisThresh = 7.5f; // ترقية تلقائية للعتبة بعد فلتر الـ PWM الجديد
+    if (t.kurtosisThresh < 15.0f) t.kurtosisThresh = 18.0f; // ترقية تلقائية للعتبة لتلائم محرك كتلر
     dspEngine.setConfig(t);
   }
   float savedKWh = dspPrefs.getFloat("ekwh", 0.0f);
