@@ -268,12 +268,18 @@ void handleLine(const char* l) {
   }
   if (l[0] == 'I' && l[1] == 'S') { dspEngine.resetSteps(); return; }
   if (l[0] == 'I' && l[1] == 'A') { dspEngine.resetArcingScore(); return; }
+  if ((l[0] == 'M' && l[1] == 'M') || (l[0] == 'L' && l[1] == 'M')) {
+    dspEngine.onMaintenanceLubricated();
+    dspDirty = true;
+    dspDirtyMs = millis();
+    char mmCmd[4] = "MM";
+    mhe.pushCommand(mmCmd);
+    sendLine("LM:OK
+");
+    Serial.println("[LUBE] Maintenance reset & empty belt baseline calibration triggered.");
+    return;
+  }
   if (l[0] == 'M') {
-    if (l[1] == 'M') {
-      dspEngine.onMaintenanceLubricated();
-      dspDirty = true;
-      dspDirtyMs = millis();
-    }
     mhe.pushCommand(l);
     return;
   }
