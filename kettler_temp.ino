@@ -120,7 +120,7 @@ char lastStopReason[48] = "NORMAL";
 
 volatile float lastTemp = -100.0f;
 
-// ---------- سجل آخر 5 أخطاء للأمان المحفوظة في فلاش NVS (v35) ----------
+// ---------- سجل آخر 5 أخطاء للأمان المحفوظة في فلاش NVS (v35.7) ----------
 struct FaultRecord {
   uint8_t code;
   uint32_t timestampMs;

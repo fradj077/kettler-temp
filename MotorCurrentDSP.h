@@ -425,9 +425,15 @@ public:
     }
     bool isAccelerating = (nowMs - _speedChangeMs) < 2500;
 
-    // بوابة وجود الراكب (Runner Presence Lock Gate)
-    float emptyRef = _m.emptyBeltA > 0.5f ? _m.emptyBeltA : 1.08f;
-    bool runnerOnBelt = !isAccelerating && ((_smoothedCurrentA >= (emptyRef + 0.45f)) || (_smoothedCurrentA >= 1.65f));
+    // بوابة وجود الراكب (Runner Presence Lock Gate - v35.7 Calibrated)
+    // خط الأساس التقديري لتيار السير الفارغ يتناسب طردياً مع السرعة (~1.35A عند 1 كم/س إلى ~2.15A عند 10 كم/س)
+    float speedEmptyBase = 1.35f + (liveSpeedKmh * 0.08f);
+    float emptyRef = (_m.emptyBeltA > 0.5f && _m.emptyBeltA < 3.0f) ? _m.emptyBeltA : speedEmptyBase;
+    if (emptyRef < speedEmptyBase * 0.85f) emptyRef = speedEmptyBase;
+
+    // شرط وجود الراكب: عدم التسارع، والسرعة >= 0.5 كم/س، وتجاوز التيار خط الأساس الفارغ بـ +0.40A
+    // (تم إلغاء الشرط الثابت القديم 1.65A لمنع العد الكاذب والسير يدور فارغاً)
+    bool runnerOnBelt = !isAccelerating && (liveSpeedKmh >= 0.5f) && (_smoothedCurrentA >= (emptyRef + 0.40f));
 
     static float _stepDcBaseline = 0.0f;
     if (_stepDcBaseline < 0.1f) _stepDcBaseline = instantA;
@@ -485,9 +491,12 @@ public:
             _stepArmed = true;
           }
         } else {
+          // ربط حساسية ضربة القدم (_cfg.stepDeltaA) ديناميكياً مع متوسط قمة الصدمة (v35.7)
           float dynPeak = (_leftPeakSum + _rightPeakSum) * 0.5f;
-          float triggerThresh = (dynPeak > 0.03f) ? (0.05f + dynPeak * 0.20f) : 0.06f;
-          if (triggerThresh > 0.15f) triggerThresh = 0.15f;
+          float baseThresh = _cfg.stepDeltaA * 0.35f; // عتبة الأساس المتناسبة مع حساسية المستخدم
+          float triggerThresh = (dynPeak > 0.03f) ? (baseThresh + dynPeak * 0.18f) : baseThresh;
+          if (triggerThresh < 0.045f) triggerThresh = 0.045f;
+          if (triggerThresh > 0.35f) triggerThresh = 0.35f;
 
           if (acGait >= triggerThresh && dtStep >= 230) {
             _stepArmed = false;
