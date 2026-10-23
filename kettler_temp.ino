@@ -54,6 +54,8 @@ void sendLong(const char* s);
 void dspSave();
 void dspSend();
 void sendStatus();
+volatile bool rawDumpReq = false;
+void rawDumpPump();
 
 // إعدادات تُضبط من التطبيق وتُحفظ في ذاكرة اللوحة
 struct Cfg {
@@ -1284,8 +1286,6 @@ void setup() {
 
 
 // ---------- تصدير العينات الخام 512 نقطة بسلاسة وبدون تجميد البلوتوث (Non-Blocking) ----------
-volatile bool rawDumpReq = false;
-
 void rawDumpPump() {
   if (!rawDumpReq) return;
   static int dumpIdx = -1;
