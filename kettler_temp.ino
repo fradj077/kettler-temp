@@ -274,8 +274,7 @@ void handleLine(const char* l) {
     dspDirtyMs = millis();
     char mmCmd[4] = "MM";
     mhe.pushCommand(mmCmd);
-    sendLine("LM:OK
-");
+    sendLine("LM:OK\n");
     Serial.println("[LUBE] Maintenance reset & empty belt baseline calibration triggered.");
     return;
   }
