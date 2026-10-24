@@ -1854,7 +1854,7 @@ iframe[src*="netlify"], [class*="netlify"], [id*="netlify"], [data-netlify-deplo
 <div class="compact-cockpit-bar">
   <div class="ccb-brand">
     <span>🏃 Kettler S2</span>
-    <span class="ccb-ver">v91.6</span>
+    <span class="ccb-ver" onclick="forceAppUpdate()" style="cursor:pointer" title="اضغط لتحديث النسخة">v91.7 🔄</span>
   </div>
   <div class="ccb-status">
     <span class="dot" id="dot"></span>
@@ -2325,7 +2325,7 @@ iframe[src*="netlify"], [class*="netlify"], [id*="netlify"], [data-netlify-deplo
     <div class="m-tile">
       <div class="m-tile-lbl">سحب السير الفارغ</div>
       <b class="m-tile-val" id="curEmpty">-- A</b>
-      <span class="m-tile-sub"><span>المرجع المعاير:</span> <b id="dspBLDisplay">1.8A</b></span>
+      <span class="m-tile-sub"><span>المرجع المعاير:</span> <b id="dspBLDisplay">1.38A</b></span>
     </div>
 
     <!-- 4. الخطوات الميكانيكية وإيقاع الجري والتناسق (بدون وزن) -->
@@ -2415,7 +2415,7 @@ iframe[src*="netlify"], [class*="netlify"], [id*="netlify"], [data-netlify-deplo
       </div>
       <div class="cfg-row">
         <div class="cfg-label">خط أساس السير بعد التشحيم <button type="button" class="dsp-info-btn" onclick="showDspTip('bl')" title="شرح البارامتر">?</button><small>[يتعلم ذاتياً عند الضغط على "تم التشحيم"]</small></div>
-        <div class="cfg-input-wrap"><input id="dspBL" type="number" inputmode="decimal" step="0.01" min="0.5" max="5"> <span>A</span></div>
+        <div class="cfg-input-wrap"><input id="dspBL" type="number" inputmode="decimal" step="0.01" min="0.5" max="5" value="1.38"> <span>A</span></div>
       </div>
       <div class="cfg-row">
         <div class="cfg-label">معايرة الحساسية تلقائياً <span dir="ltr" style="display:inline-block">(Auto Ratiometric)</span> <button type="button" class="dsp-info-btn" onclick="showDspTip('aes')" title="شرح البارامتر">?</button><small>[حساب الحساسية تلقائياً من جهد الصفر الفعلي]</small></div>
@@ -4005,7 +4005,7 @@ async function doLubeMaint(){
     await mhAsk('MM');
     await sleepMs(120);
     await bridgeCmd('BKR:BL=' + targetBL.toFixed(2));
-    window.lastCalibratedBL = targetBL;
+    window.lastCalibratedBL = targetBL; try{ localStorage.setItem('kettler_cal_bl', targetBL.toFixed(2)); }catch(_){}
     if(!liveE) window._pendingLubeAutoCapture = true;
     if($('dspBLDisplay')) $('dspBLDisplay').textContent = targetBL.toFixed(2) + 'A';
     document.querySelectorAll('#dspBL').forEach(el => { el.value = targetBL.toFixed(2); });
@@ -6475,7 +6475,39 @@ window.addEventListener('DOMContentLoaded', purgeNetlify);
 window.addEventListener('load', purgeNetlify);
 setInterval(purgeNetlify, 500);
 
-if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+window.lastCalibratedBL = parseFloat(localStorage.getItem('kettler_cal_bl') || '1.38') || 1.38;
+document.addEventListener('DOMContentLoaded', () => {
+  const savedBL = parseFloat(localStorage.getItem('kettler_cal_bl') || '1.38') || 1.38;
+  window.lastCalibratedBL = savedBL;
+  if($('dspBLDisplay')) $('dspBLDisplay').textContent = savedBL.toFixed(2) + 'A';
+  document.querySelectorAll('#dspBL').forEach(el => { el.value = savedBL.toFixed(2); });
+});
+async function forceAppUpdate(){
+  try{
+    if('caches' in window){
+      const ks = await caches.keys();
+      await Promise.all(ks.map(k => caches.delete(k)));
+    }
+    if('serviceWorker' in navigator){
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+  }catch(_){}
+  location.replace(location.pathname + '?v=' + Date.now());
+}
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('sw.js').then(reg => { try{ reg.update(); }catch(_){} });
+  if('caches' in window && navigator.onLine){
+    fetch('./index.html?fresh=' + Date.now(), {cache: 'no-store'}).then(r => {
+      if(r.ok){
+        caches.open('kettler-v91').then(c => {
+          c.put('./', r.clone());
+          c.put('./index.html', r.clone());
+        });
+      }
+    }).catch(()=>{});
+  }
+}
 
 let dspCfgSaving = false;
 function dspCfgOnLine(t){
@@ -6503,11 +6535,22 @@ function dspCfgOnLine(t){
   setVal('dspSTP', o.T, 2);
   setVal('dspSNS', o.S, 1);
   setVal('dspV', o.V, 0);
-  setVal('dspBL', o.BL, 2);
   if(o.BL != null && !isNaN(o.BL) && o.BL >= 0.45){
-    window.lastCalibratedBL = o.BL;
-    document.querySelectorAll('#dspBL').forEach(el => { if(document.activeElement !== el) el.value = o.BL.toFixed(2); });
-    if($('dspBLDisplay')) $('dspBLDisplay').textContent = o.BL.toFixed(2) + 'A';
+    let effectiveBL = o.BL;
+    const savedLocalBL = parseFloat(localStorage.getItem('kettler_cal_bl') || '1.38');
+    if(Math.abs(o.BL - 1.80) < 0.025 && Math.abs(savedLocalBL - 1.80) >= 0.03){
+      effectiveBL = savedLocalBL;
+      if(!window._autoMigratedBL){
+        window._autoMigratedBL = true;
+        setTimeout(() => { bridgeCmd('BKR:BL=' + effectiveBL.toFixed(2)); }, 300);
+      }
+    } else {
+      try{ localStorage.setItem('kettler_cal_bl', effectiveBL.toFixed(2)); }catch(_){}
+    }
+    window.lastCalibratedBL = effectiveBL;
+    setVal('dspBL', effectiveBL, 2);
+    document.querySelectorAll('#dspBL').forEach(el => { if(document.activeElement !== el) el.value = effectiveBL.toFixed(2); });
+    if($('dspBLDisplay')) $('dspBLDisplay').textContent = effectiveBL.toFixed(2) + 'A';
   }
   if(o.AE != null){ document.querySelectorAll('#dspAutoSens').forEach(el => { el.value = String(Math.round(o.AE)); }); }
   setVal('dspInertia', o.IJ, 1);
@@ -7005,7 +7048,7 @@ window.copyRawData = copyRawData;
       </div>
       <div class="cfg-row">
         <div class="cfg-label">خط أساس السير بعد التشحيم <button type="button" class="dsp-info-btn" onclick="showDspTip('bl')" title="شرح البارامتر">?</button><small>[يتعلم ذاتياً عند الضغط على "تم التشحيم"]</small></div>
-        <div class="cfg-input-wrap"><input id="dspBL" type="number" inputmode="decimal" step="0.01" min="0.5" max="5"> <span>A</span></div>
+        <div class="cfg-input-wrap"><input id="dspBL" type="number" inputmode="decimal" step="0.01" min="0.5" max="5" value="1.38"> <span>A</span></div>
       </div>
       <div class="cfg-row">
         <div class="cfg-label">معايرة الحساسية تلقائياً <span dir="ltr" style="display:inline-block">(Auto Ratiometric)</span> <button type="button" class="dsp-info-btn" onclick="showDspTip('aes')" title="شرح البارامتر">?</button><small>[حساب الحساسية تلقائياً من جهد الصفر الفعلي]</small></div>
