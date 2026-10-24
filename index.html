@@ -1854,7 +1854,7 @@ iframe[src*="netlify"], [class*="netlify"], [id*="netlify"], [data-netlify-deplo
 <div class="compact-cockpit-bar">
   <div class="ccb-brand">
     <span>🏃 Kettler S2</span>
-    <span class="ccb-ver">v91.5</span>
+    <span class="ccb-ver">v91.6</span>
   </div>
   <div class="ccb-status">
     <span class="dot" id="dot"></span>
@@ -2357,7 +2357,7 @@ iframe[src*="netlify"], [class*="netlify"], [id*="netlify"], [data-netlify-deplo
     <!-- أزرار الصيانة والمعايرة المباشرة السريعة -->
     <div class="row r3" style="margin: 12px 0 10px; gap: 6px;">
       <button type="button" onclick="doZeroCalib()" style="min-height:42px;font-size:12.5px;font-weight:700">🎯 معايرة الصفر</button>
-      <button type="button" id="mhMaint" onclick="bridgeCmd('LM')" style="min-height:42px;font-size:12.5px;font-weight:700;background:rgba(34,197,94,0.15);border:1px solid var(--ok);color:var(--ok)">💧 تم التشحيم</button>
+      <button type="button" id="mhMaint" onclick="doLubeMaint()" style="min-height:42px;font-size:12.5px;font-weight:700;background:rgba(34,197,94,0.15);border:1px solid var(--ok);color:var(--ok)">💧 تم التشحيم</button>
       <button type="button" onclick="bridgeCmd('IS')" style="min-height:42px;font-size:12.5px">🔄 تصفير الخطوات</button>
     </div>
 
@@ -2415,7 +2415,7 @@ iframe[src*="netlify"], [class*="netlify"], [id*="netlify"], [data-netlify-deplo
       </div>
       <div class="cfg-row">
         <div class="cfg-label">خط أساس السير بعد التشحيم <button type="button" class="dsp-info-btn" onclick="showDspTip('bl')" title="شرح البارامتر">?</button><small>[يتعلم ذاتياً عند الضغط على "تم التشحيم"]</small></div>
-        <div class="cfg-input-wrap"><input id="dspBL" type="number" inputmode="decimal" step="0.05" min="0.5" max="5" readonly style="opacity:0.85"> <span>A</span></div>
+        <div class="cfg-input-wrap"><input id="dspBL" type="number" inputmode="decimal" step="0.01" min="0.5" max="5"> <span>A</span></div>
       </div>
       <div class="cfg-row">
         <div class="cfg-label">معايرة الحساسية تلقائياً <span dir="ltr" style="display:inline-block">(Auto Ratiometric)</span> <button type="button" class="dsp-info-btn" onclick="showDspTip('aes')" title="شرح البارامتر">?</button><small>[حساب الحساسية تلقائياً من جهد الصفر الفعلي]</small></div>
@@ -3992,14 +3992,35 @@ setInterval(() => {                                // the board cannot see the t
 }, 5000);
 $('mhRef').onclick = mhRefresh;
 $('mhTime').onclick = async () => { if(!tRx){ log('اتصل بالحساس أولاً'); return; } await mhAsk('MT' + Math.floor(Date.now()/1000)); mhRefresh(); };
-$('mhMaint').onclick = async () => {
-  if(!tRx){ log('اتصل بالحساس أولاً'); return; }
-  if(await askSheet('هل تم تشحيم الحزام / صيانة المشاية؟ سيُصفَّر عدّاد الساعات، وستقوم اللوحة في أول تشغيل بمعايرة سحب السير المزيّت واعتماده كخط أساس جديد للاحتكاك.', 'نعم، تم')){
+async function doLubeMaint(){
+  if(!tRx){ toast('⚠️ اتصل بالحساس أولاً'); log('اتصل بالحساس أولاً'); return; }
+  const curEmptyTxt = $('curEmpty') ? $('curEmpty').textContent : '';
+  const parsedE = parseFloat(curEmptyTxt);
+  const liveE = (!isNaN(parsedE) && parsedE >= 0.45 && parsedE <= 2.8) ? parsedE : ((window.lastEmptyBeltA >= 0.45 && window.lastEmptyBeltA <= 2.8) ? window.lastEmptyBeltA : null);
+  const targetBL = liveE ? liveE : 1.38;
+  const msg = liveE
+    ? ('هل تم تشحيم الحزام؟ سيُصفَّر عدّاد الساعات (0 / 25)، ويُعتمد سحب السير الفارغ الفعلي الحالي (' + liveE.toFixed(2) + ' A) فوراً كمرجع معاير جديد في ذاكرة اللوحة.')
+    : ('هل تم تشحيم الحزام؟ سيُصفَّر عدّاد الساعات ويُضبط المرجع المعاير على (' + targetBL.toFixed(2) + ' A)، وعند تشغيل السير فارغاً سيُحدَّث تلقائياً لقراءة السير الحية.');
+  if(await askSheet(msg, 'نعم، اعتمد التشحيم')){
     await mhAsk('MM');
+    await sleepMs(120);
+    await bridgeCmd('BKR:BL=' + targetBL.toFixed(2));
+    window.lastCalibratedBL = targetBL;
+    if(!liveE) window._pendingLubeAutoCapture = true;
+    if($('dspBLDisplay')) $('dspBLDisplay').textContent = targetBL.toFixed(2) + 'A';
+    document.querySelectorAll('#dspBL').forEach(el => { el.value = targetBL.toFixed(2); });
+    if($('curFric')){
+      $('curFric').textContent = '100%';
+      $('curFric').style.color = 'var(--ok)';
+    }
+    await sleepMs(150);
+    await bridgeCmd('PQ');
     mhRefresh();
-    log('تم تسجيل التشحيم — ستقوم اللوحة في أول تشغيل بحساب خط أساس تيار السير المزيّت');
+    toast('✓ تم تصفير الساعات واعتماد المرجع المعاير الجديد: ' + targetBL.toFixed(2) + 'A');
+    log('تم تسجيل التشحيم واعتماد المرجع المعاير الجديد في اللوحة: ' + targetBL.toFixed(2) + ' A');
   }
-};
+}
+if($('mhMaint')) $('mhMaint').onclick = doLubeMaint;
 $('mhReset').onclick = async () => {
   if(!tRx){ log('اتصل بالحساس أولاً'); return; }
   if(await askSheet('سيُمسح خط الأساس ويبدأ التعلّم من جديد (يبقى سجل التمارين). استعمله بعد صيانة أو تغيير الحزام أو المحرك.', 'إعادة التعلّم')){ await mhAsk('MR'); mhRefresh(); }
@@ -5939,11 +5960,32 @@ function curOnLine(t){
     bEl.style.color = st.c;
   }
   if(o.S != null && $('curSteps')) $('curSteps').textContent = Math.round(o.S);
-  if(o.E != null && $('curEmpty')) $('curEmpty').textContent = o.E.toFixed(2) + ' A';
+  if(o.E != null && $('curEmpty')){
+    $('curEmpty').textContent = o.E.toFixed(2) + ' A';
+    if(o.E >= 0.45 && o.E <= 2.8){
+      window.lastEmptyBeltA = o.E;
+      if(window._pendingLubeAutoCapture){
+        window._pendingLubeCount = (window._pendingLubeCount || 0) + 1;
+        if(window._pendingLubeCount >= 3){
+          window._pendingLubeAutoCapture = false;
+          window._pendingLubeCount = 0;
+          const newBl = o.E;
+          window.lastCalibratedBL = newBl;
+          if($('dspBLDisplay')) $('dspBLDisplay').textContent = newBl.toFixed(2) + 'A';
+          document.querySelectorAll('#dspBL').forEach(el => { el.value = newBl.toFixed(2); });
+          bridgeCmd('BKR:BL=' + newBl.toFixed(2));
+          setTimeout(() => bridgeCmd('PQ'), 250);
+          toast('✓ تم التقاط وحفظ المرجع المعاير الجديد تلقائياً: ' + newBl.toFixed(2) + 'A');
+        }
+      }
+    }
+  }
   if(o.R != null && $('curFric')){
     const fEl = $('curFric');
-    fEl.textContent = Math.round(o.R) + '%';
-    fEl.style.color = o.R >= 150 ? 'var(--red)' : (o.R >= 130 ? 'var(--amber)' : 'var(--ok)');
+    const activeBL = (window.lastCalibratedBL >= 0.45) ? window.lastCalibratedBL : null;
+    const calcR = (activeBL && o.E != null && o.E >= 0.45) ? Math.round((o.E / activeBL) * 100) : Math.round(o.R);
+    fEl.textContent = calcR + '%';
+    fEl.style.color = calcR >= 150 ? 'var(--red)' : (calcR >= 130 ? 'var(--amber)' : 'var(--ok)');
   }
 
   
@@ -6462,6 +6504,11 @@ function dspCfgOnLine(t){
   setVal('dspSNS', o.S, 1);
   setVal('dspV', o.V, 0);
   setVal('dspBL', o.BL, 2);
+  if(o.BL != null && !isNaN(o.BL) && o.BL >= 0.45){
+    window.lastCalibratedBL = o.BL;
+    document.querySelectorAll('#dspBL').forEach(el => { if(document.activeElement !== el) el.value = o.BL.toFixed(2); });
+    if($('dspBLDisplay')) $('dspBLDisplay').textContent = o.BL.toFixed(2) + 'A';
+  }
   if(o.AE != null){ document.querySelectorAll('#dspAutoSens').forEach(el => { el.value = String(Math.round(o.AE)); }); }
   setVal('dspInertia', o.IJ, 1);
   setVal('dspIncComp', o.NC, 2);
@@ -6490,6 +6537,7 @@ async function dspCfgSave(){
   const t = Math.max(0.08, Math.min(0.8, getF('dspSTP', 0.22)));
   const s = Math.max(15, Math.min(45, getF('dspSNS', 26.4)));
   const v = Math.max(90, Math.min(240, getF('dspV', 180.0)));
+  const bl = Math.max(0.50, Math.min(4.50, getF('dspBL', window.lastCalibratedBL || 1.38)));
   const ae = parseInt(document.getElementById('dspAutoSens')?.value || '1', 10);
   const ij = Math.max(1.0, Math.min(10.0, getF('dspInertia', 3.5)));
   const nc = Math.max(0.0, Math.min(0.50, getF('dspIncComp', 0.15)));
@@ -6506,7 +6554,7 @@ async function dspCfgSave(){
   if(bZ) bZ.disabled = true;
 
   try {
-    const cmds = ['PF' + f, 'PL' + l, 'PD' + d, 'PK' + k, 'PW' + w, 'PC' + c, 'PB' + b, 'PT' + t, 'PS' + s, 'PV' + v, 'PE' + ae, 'PJ' + ij, 'PN' + nc, 'PZ' + zt];
+    const cmds = ['PF' + f, 'PL' + l, 'PD' + d, 'PK' + k, 'PW' + w, 'PC' + c, 'PB' + b, 'PT' + t, 'PS' + s, 'PV' + v, 'PE' + ae, 'PJ' + ij, 'PN' + nc, 'PZ' + zt, 'BKR:BL=' + bl.toFixed(2)]; window.lastCalibratedBL = bl; if($('dspBLDisplay')) $('dspBLDisplay').textContent = bl.toFixed(2) + 'A';
     for(const cmd of cmds){
       await bridgeCmd(cmd);
       await sleepMs(100);
@@ -6957,7 +7005,7 @@ window.copyRawData = copyRawData;
       </div>
       <div class="cfg-row">
         <div class="cfg-label">خط أساس السير بعد التشحيم <button type="button" class="dsp-info-btn" onclick="showDspTip('bl')" title="شرح البارامتر">?</button><small>[يتعلم ذاتياً عند الضغط على "تم التشحيم"]</small></div>
-        <div class="cfg-input-wrap"><input id="dspBL" type="number" inputmode="decimal" step="0.05" min="0.5" max="5" readonly style="opacity:0.85"> <span>A</span></div>
+        <div class="cfg-input-wrap"><input id="dspBL" type="number" inputmode="decimal" step="0.01" min="0.5" max="5"> <span>A</span></div>
       </div>
       <div class="cfg-row">
         <div class="cfg-label">معايرة الحساسية تلقائياً <span dir="ltr" style="display:inline-block">(Auto Ratiometric)</span> <button type="button" class="dsp-info-btn" onclick="showDspTip('aes')" title="شرح البارامتر">?</button><small>[حساب الحساسية تلقائياً من جهد الصفر الفعلي]</small></div>
@@ -7108,7 +7156,7 @@ window.copyRawData = copyRawData;
       <div style="font-size:11.5px;color:var(--dim);margin-top:6px;line-height:1.6">يلزم تشحيم السير بزيت السيليكون كل 25 ساعة تشغيل فعلية لحماية المحرك من السحب الزائد</div>
     </div>
     <div style="display:flex;flex-direction:column;gap:10px">
-      <button type="button" id="mhMaint" onclick="bridgeCmd('LM')" style="min-height:48px;font-size:14px;font-weight:800;background:rgba(34,197,94,0.15);border:1px solid var(--ok);color:var(--ok);border-radius:12px">💧 تم التشحيم الآن (إعادة ضبط عداد 25 ساعة)</button>
+      <button type="button" id="mhMaintPageBtn" onclick="doLubeMaint()" style="min-height:48px;font-size:14px;font-weight:800;background:rgba(34,197,94,0.15);border:1px solid var(--ok);color:var(--ok);border-radius:12px">💧 تم التشحيم الآن (إعادة ضبط عداد 25 ساعة)</button>
       <button type="button" onclick="doZeroCalib()" style="min-height:48px;font-size:14px;font-weight:800;border-radius:12px">🎯 معايرة الصفر لحساس التيار (ACS758 Zero Calib)</button>
       <button type="button" onclick="bridgeCmd('IS')" style="min-height:48px;font-size:14px;border-radius:12px">🔄 تصفير عداد الخطوات الحركي</button>
     </div>
