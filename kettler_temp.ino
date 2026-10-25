@@ -1408,9 +1408,9 @@ void loop() {
     lastCurMs = now;
     auto m = dspEngine.getMetrics();
     char b[128];
-    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,P=%.1f,E=%.2f,R=%.0f\n",
+    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,C=%u,P=%.1f,E=%.2f,R=%.0f\n",
              m.currentA, m.kurtosis, (int)m.brushHealth, m.powerWatts,
-             (unsigned)m.stepCount, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct);
+             (unsigned)m.stepCount, (unsigned)m.cadenceSpm, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct);
     sendLine(b);
     if (m.stallAlert) {
       latchedFaults |= FAULT_STALL_LATCH;
