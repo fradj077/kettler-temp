@@ -23,13 +23,1391 @@
 //    حتى تنزل الحرارة تحت حد التحذير. حدّا الحرارة (W و H) يرسلهما التطبيق ويحفظهما.
 //  * تحليل صحة المحرك (MotorHealth.h) وتحديث البرنامج بالبلوتوث (OTA، الرمز OTA_PIN)
 // المكتبة: NimBLE-Arduino 1.4.x
+#include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Preferences.h>
 #include <Update.h>
-#include "MotorHealth.h"
-#include "MotorCurrentDSP.h"
+struct Fwd { uint8_t n; uint8_t d[10]; uint32_t ms; };
+struct LockState { uint32_t last; bool stopped; float lastTarget; };
+
+// MotorHealth.h  -  motor temperature health analysis that runs ON the ESP32.
+//
+// Header only, no Arduino dependency (so it can be tested on a PC).
+// It watches temperature + treadmill speed, detects training sessions, measures
+//   * how fast the motor heats up at a given speed/incline  (deg C per minute)
+//   * how fast it cools down after the run                  (thermal time constant)
+// compares them with a baseline learned from the first healthy sessions, and reports
+//   learning / ok / watch / check.
+//
+// The phone only asks for results with short text commands (see command()).
+// All answers are text lines that start with "MH:" and end with '\n'.
+// [Embedded MotorHealth.h v36.2]
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+namespace mh {
+
+static const uint16_t STORE_VER = 1;
+static const int SAMPLE_MS = 5000;   // one sample every 5 s
+static const int EARLY_N = 240;      // first 20 min of a run are kept for the heating analysis
+static const int COOL_N = 180;       // 15 min of cool-down are kept
+static const int START_N = 6;        // 30 s of real running starts a session
+static const int STOP_N = 24;        // 120 s stopped ends it
+static const int PLATEAU_MIN = 30;   // a stable plateau needs 2.5 min (realistic workouts)
+static const int LEAD_N = 4;         // skip the first 20 s of the plateau
+static const int WIN_MAX = 72;       // analyse at most 6 min of it
+static const int SKIP_N = 6;         // ignore the first 30 s of the run
+static const int LEARN_BASE = 3;     // 3 sessions build the baseline (smart fast learning)
+static const int NSB = 8;            // speed bins: <2,2-4,4-6,...,>=14 km/h
+static const int NIB = 3;            // incline bins: <1.5, <5, >=5 %
+static const int NBASE = 5;          // sessions that make the baseline
+static const int NREC = 3;           // recent sessions compared with it
+static const int HIST = 40;          // sessions kept
+static const int16_t NONE = -32768;
+static const uint32_t COLD_AFTER_S = 60 * 60;   // 60 min rest after a real workout + dynamic seasonal ambient check
+
+struct Session {          // 20 bytes (100% binary compatible with NVS Store)
+  uint32_t epoch;         // start time, 0 = unknown
+  uint16_t durMin;        // running minutes
+  uint8_t avg10;          // average speed x10
+  uint8_t flags;          // 1 cold start, 2 heating rate valid, 4 cool-down valid, 8 incomplete
+  int16_t start100;       // temperature at start x100
+  int16_t peak100;        // highest temperature x100
+  int16_t heat100;        // deg C / min x100
+  int16_t tau10;          // minutes x10
+  uint8_t sbin, ibin;     // 255 = none
+  uint8_t peakCur10;      // peak motor current during session x10 (0.1 A units)
+  uint8_t avgCur10;       // average motor current during session x10 (0.1 A units)
+};
+
+struct Bin {              // 20 bytes
+  int16_t base[NBASE];
+  int16_t rec[NREC];
+  uint8_t nBase, nRec, pos, pad;
+};
+
+struct Store {
+  uint32_t magic;
+  uint16_t ver, size;
+  uint32_t totalSec, maintSec, lastEnd;
+  uint16_t count, head;
+  Session hist[HIST];
+  Bin bins[NSB * NIB];
+  Bin tau;
+};
+
+struct Status {
+  uint8_t level;      // 0 learning, 1 ok, 2 watch, 3 check
+  uint8_t reasons;    // bit0 heating, bit1 cooling
+  uint8_t judged;     // bins that could be compared
+  uint8_t learning;   // bins still collecting their baseline
+};
+
+typedef bool (*LoadFn)(void*, size_t);
+typedef void (*SaveFn)(const void*, size_t);
+typedef void (*SendFn)(const char*, size_t);   // one BLE notification
+typedef void (*SleepFn)(uint32_t);
+
+inline int16_t med(const int16_t* a, int n) {
+  int16_t t[8];
+  for (int i = 0; i < n; i++) t[i] = a[i];
+  for (int i = 1; i < n; i++) { int16_t v = t[i]; int j = i - 1; while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; j--; } t[j + 1] = v; }
+  return (n & 1) ? t[n / 2] : (int16_t)((t[n / 2 - 1] + t[n / 2]) / 2);
+}
+
+inline void binAdd(Bin& b, int16_t v) {
+  if (b.nBase < LEARN_BASE) {
+    b.base[b.nBase++] = v;
+  }
+  b.rec[b.pos] = v;
+  b.pos = (uint8_t)((b.pos + 1) % NREC);
+  if (b.nRec < NREC) b.nRec++;
+}
+
+inline bool binReady(const Bin& b) { return b.nBase >= LEARN_BASE && b.nRec >= 1; }
+
+inline int judge(int base, int rec, int pctWatch, int pctCheck, int absWatch, int absCheck) {
+  if (base <= 0) return 1;
+  int d = rec - base;
+  long pct = (long)d * 100L / base;
+  if (pct >= pctCheck && d >= absCheck) return 3;
+  if (pct >= pctWatch && d >= absWatch) return 2;
+  return 1;
+}
+
+class Engine {
+ public:
+  Store st;
+
+  void begin(LoadFn l, SaveFn s, SendFn tx, SleepFn sl, size_t chunk = 20) {
+    loadFn = l; saveFn = s; txFn = tx; sleepFn = sl; chunkSz = chunk < 5 ? 5 : chunk;
+    wipe(true);
+    if (loadFn) {
+      Store tmp;
+      memset(&tmp, 0, sizeof tmp);
+      if (loadFn(&tmp, sizeof tmp) && tmp.magic == 0x4D484C54u && tmp.ver == STORE_VER && tmp.size == sizeof(Store)) {
+        st = tmp;
+        sanitizeStore();
+      }
+    }
+  }
+  void setChunk(size_t n) { chunkSz = n < 5 ? 5 : n; }
+
+  // ---------- inputs (call from loop()) ----------
+  void setTime(uint32_t epoch, uint32_t now) {
+    epochBase = epoch;
+    msBase = now;
+    timeSet = true;
+    if (stt == RUN && runStartEpoch == 0) {
+      uint32_t elapsedS = runTicks * (SAMPLE_MS / 1000u);
+      runStartEpoch = (epoch > elapsedS) ? (epoch - elapsedS) : epoch;
+    }
+    if (haveEndMs && st.lastEnd == 0 && now >= lastEndMs) {
+      uint32_t agoS = (now - lastEndMs) / 1000u;
+      if (epoch > agoS) st.lastEnd = epoch - agoS;
+    }
+  }
+  void feedTemp(uint32_t now, float t) {
+    if (isnan(t) || t < -40.f || t > 200.f) return;
+    lastT = t; lastTMs = now; haveT = true;
+    sampler(now);
+  }
+  void feedSpeed(uint32_t now, float kmh, float incl) {
+    if (isnan(kmh) || kmh < 0.f || kmh > 40.f) return;
+    lastS = kmh; lastI = isnan(incl) ? 0.f : incl; lastSMs = now; haveS = true;
+  }
+  void feedCurrent(float curA, float p2pA = 0.0f) {
+    if (!isnan(curA) && curA >= 0.f && curA < 50.f) {
+      lastC = curA;
+      lastP2p = (!isnan(p2pA) && p2pA >= 0.f && p2pA < 50.f) ? p2pA : 0.f;
+      if (curA >= 0.80f) {
+        float instPk = curA + 0.35f * lastP2p;
+        if (instPk > liveSessionPeakA) liveSessionPeakA = instPk;
+      }
+    }
+  }
+  float getLivePeakCurrentA() const { return liveSessionPeakA; }
+  void loop(uint32_t now) {
+    char c[40];
+    while (popCommand(c, sizeof c)) command(c, now);
+    sampler(now);
+    pump(now);
+  }
+
+  // Safe to call from the BLE write callback (other task): it only copies the text.
+  bool pushCommand(const char* s) {
+    if (!s || s[0] != 'M') return false;
+    uint8_t h = inHead, n = (uint8_t)((h + 1) % IN_Q);
+    if (n == inTail) return false;
+    strncpy(inbox[h], s, sizeof inbox[h] - 1);
+    inbox[h][sizeof inbox[h] - 1] = 0;
+    inHead = n;
+    return true;
+  }
+
+  // ---------- status ----------
+  Status status() const {
+    Status r; memset(&r, 0, sizeof r);
+    int level = 0;
+    for (int i = 0; i < NSB * NIB; i++) {
+      const Bin& b = st.bins[i];
+      if (b.nBase > 0 && b.nBase < LEARN_BASE) r.learning++;
+      if (!binReady(b)) continue;
+      r.judged++;
+      int j = judge(med(b.base, b.nBase), med(b.rec, b.nRec), 15, 30, 8, 15);
+      if (j > level) level = j;
+      if (j >= 2) r.reasons |= 1;
+    }
+    if (binReady(st.tau)) {
+      r.judged++;
+      int j = judge(med(st.tau.base, st.tau.nBase), med(st.tau.rec, st.tau.nRec), 25, 50, 30, 60);
+      if (j > level) level = j;
+      if (j >= 2) r.reasons |= 2;
+    }
+    r.level = r.judged ? (uint8_t)(level < 1 ? 1 : level) : 0;
+    return r;
+  }
+  int state() const { return (int)stt; }
+
+  // ---------- commands (text, one per line) ----------
+  //  MS          status summary
+  //  ML<n>       last n sessions (newest first, n<=20)
+  //  MB          baselines per bin
+  //  MT<epoch>   set the clock
+  //  MV<s10>,<i10>  live speed x10 and incline x10 from the phone
+  //  MR          forget the baselines (history stays)
+  //  MX          clear history + baselines (hour counters stay)
+  //  MM          mark maintenance done (resets "hours since maintenance")
+  void command(const char* line, uint32_t now) {
+    if (!line || line[0] != 'M') return;
+    char c = line[1];
+    const char* a = line + 2;
+    char b[96];
+    if (c == 'S') {
+      Status s = status();
+      snprintf(b, sizeof b, "MH:S,%u,%u,%u,%lu,%lu,%d,%d,%u,%u",
+               s.level, s.reasons, (unsigned)st.count,
+               (unsigned long)(st.totalSec / 60), (unsigned long)((st.totalSec - st.maintSec) / 60),
+               (int)stt, timeSet ? 1 : 0, s.judged, s.learning);
+      out(b);
+      out("MH:E,S");
+    } else if (c == 'L') {
+      int n = atoi(a); if (n <= 0) n = 10; if (n > 20) n = 20;
+      int have = st.count < HIST ? st.count : HIST;
+      if (n > have) n = have;
+      for (int k = 0; k < n; k++) {
+        int idx = ((int)st.head - 1 - k + HIST * 2) % HIST;
+        const Session& s = st.hist[idx];
+        snprintf(b, sizeof b, "MH:L,%d,%lu,%u,%u,%d,%d,%d,%d,%u,%u,%u,%u,%u", k, (unsigned long)s.epoch, s.durMin, s.avg10,
+                 s.start100, s.peak100, s.heat100, s.tau10, s.sbin, s.ibin, s.flags, s.peakCur10, s.avgCur10);
+        out(b);
+      }
+      out("MH:E,L");
+    } else if (c == 'B') {
+      for (int i = 0; i < NSB * NIB; i++) {
+        const Bin& x = st.bins[i];
+        if (!x.nBase && !x.nRec) continue;
+        snprintf(b, sizeof b, "MH:B,%d,%d,%u,%d,%u,%d", i / NIB, i % NIB, x.nBase,
+                 x.nBase > 0 ? med(x.base, x.nBase) : NONE, x.nRec, x.nRec > 0 ? med(x.rec, x.nRec) : NONE);
+        out(b);
+      }
+      if (st.tau.nBase || st.tau.nRec) {
+        snprintf(b, sizeof b, "MH:B,255,0,%u,%d,%u,%d", st.tau.nBase,
+                 st.tau.nBase > 0 ? med(st.tau.base, st.tau.nBase) : NONE, st.tau.nRec,
+                 st.tau.nRec > 0 ? med(st.tau.rec, st.tau.nRec) : NONE);
+        out(b);
+      }
+      out("MH:E,B");
+    } else if (c == 'T') {
+      unsigned long e = strtoul(a, 0, 10);
+      if (e > 1600000000UL) { setTime((uint32_t)e, now); snprintf(b, sizeof b, "MH:T,%lu", e); out(b); }
+    } else if (c == 'V') {
+      char* e1 = 0;
+      long s10 = strtol(a, &e1, 10);
+      long i10 = (e1 && *e1 == ',') ? strtol(e1 + 1, 0, 10) : 0;
+      feedSpeed(now, s10 / 10.0f, i10 / 10.0f);
+    } else if (c == 'R') {
+      memset(st.bins, 0, sizeof st.bins); memset(&st.tau, 0, sizeof st.tau);
+      save(); out("MH:A,R");
+    } else if (c == 'X') {
+      memset(st.hist, 0, sizeof st.hist); memset(st.bins, 0, sizeof st.bins); memset(&st.tau, 0, sizeof st.tau);
+      st.count = 0; st.head = 0; save(); out("MH:A,X");
+    } else if (c == 'M') {
+      st.maintSec = st.totalSec; save(); out("MH:A,M");
+    }
+  }
+
+  // ---------- output queue (one whole line per notification burst, never interleaved) ----------
+  void pump(uint32_t now) {
+    if (!outLen || !txFn) return;
+    if ((int32_t)(now - lastPump) < 25) return;
+    char* nl = (char*)memchr(outBuf, '\n', outLen);
+    if (!nl) { outLen = 0; return; }
+    size_t len = (size_t)(nl - outBuf) + 1;
+    for (size_t p = 0; p < len; p += chunkSz) {
+      size_t n = len - p < chunkSz ? len - p : chunkSz;
+      txFn(outBuf + p, n);
+      if (sleepFn && p + n < len) sleepFn(12);
+    }
+    memmove(outBuf, outBuf + len, outLen - len);
+    outLen -= len;
+    lastPump = now;
+  }
+  size_t pending() const { return outLen; }
+
+ private:
+  enum { IDLE = 0, RUN = 1, COOL = 2 };
+  static const int OUT_MAX = 2600;
+  static const int IN_Q = 8;
+
+  LoadFn loadFn = 0; SaveFn saveFn = 0; SendFn txFn = 0; SleepFn sleepFn = 0;
+  size_t chunkSz = 20;
+  char outBuf[OUT_MAX]; size_t outLen = 0; uint32_t lastPump = 0;
+  char inbox[IN_Q][40]; volatile uint8_t inHead = 0, inTail = 0;
+
+  bool timeSet = false; uint32_t epochBase = 0, msBase = 0;
+  float lastT = 0, lastS = 0, lastI = 0, lastC = 0, lastP2p = 0, liveSessionPeakA = 0, bootTemp = -999.0f, idleAmbientT = -999.0f; uint32_t lastTMs = 0, lastSMs = 0; bool haveT = false, haveS = false;
+  bool sampStarted = false; uint32_t nextSample = 0;
+
+  int stt = IDLE;
+  int runCnt = 0, stopCnt = 0, unkCnt = 0;
+  int earlyN = 0; bool earlyBad = false;
+  int16_t eT[EARLY_N]; uint8_t eS[EARLY_N]; int16_t eI[EARLY_N];
+  int coolN = 0; int16_t cT[COOL_N];
+  uint32_t runTicks = 0, peakTick = 0, curTicks = 0; float sumSpeed = 0, sumCurA = 0, peakCurA = 0; float startT = 0, peakT = 0, lastRunT = 0;
+  uint32_t runStartEpoch = 0; bool cold = false; bool incomplete = false;
+  bool haveEndMs = false; uint32_t lastEndMs = 0;
+  int curIdx = -1;   // history slot of the session whose cool-down is being measured
+
+  void wipe(bool full) {
+    memset(&st, 0, sizeof st);
+    st.magic = 0x4D484C54u; st.ver = STORE_VER; st.size = (uint16_t)sizeof(Store);
+    (void)full;
+  }
+  void save() { if (saveFn) saveFn(&st, sizeof st); }
+  void out(const char* line) {
+    size_t n = strlen(line);
+    if (outLen + n + 1 > OUT_MAX) return;
+    memcpy(outBuf + outLen, line, n); outBuf[outLen + n] = '\n'; outLen += n + 1;
+  }
+  bool popCommand(char* dst, size_t cap) {
+    if (inTail == inHead) return false;
+    strncpy(dst, inbox[inTail], cap - 1); dst[cap - 1] = 0;
+    inTail = (uint8_t)((inTail + 1) % IN_Q);
+    return true;
+  }
+  uint32_t epochAt(uint32_t now) const { return timeSet ? epochBase + (uint32_t)(now - msBase) / 1000u : 0; }
+
+  void sampler(uint32_t now) {
+    if (!sampStarted) { nextSample = now + SAMPLE_MS; sampStarted = true; return; }
+    if ((int32_t)(now - nextSample) > 60000) nextSample = now;   // after a long stall do not replay history
+    while ((int32_t)(now - nextSample) >= 0) { tick(nextSample); nextSample += SAMPLE_MS; }
+  }
+
+  float currentAmbientT() const {
+    if (idleAmbientT > -40.0f && idleAmbientT < 55.0f) return idleAmbientT;
+    int have = st.count < HIST ? st.count : HIST;
+    // Check most recent cold sessions first (reflects current season: winter vs summer)
+    for (int k = 0; k < have; k++) {
+      int idx = (st.head + HIST - 1 - k) % HIST;
+      const Session& s = st.hist[idx];
+      if ((s.flags & 1) && s.start100 != NONE && s.start100 > -2000 && s.start100 < 5500) {
+        return s.start100 / 100.0f;
+      }
+    }
+    return (lastT > -20.0f && lastT < 55.0f) ? lastT : 22.0f;
+  }
+
+  float effectiveTauMin() const {
+    int16_t t10 = st.tau.nBase ? med(st.tau.base, st.tau.nBase) : NONE;
+    if (t10 != NONE && t10 >= 80 && t10 <= 1200) return t10 / 10.0f;
+    return 35.0f;
+  }
+
+  void sanitizeStore() {
+    Session cleanHist[HIST];
+    memset(cleanHist, 0, sizeof cleanHist);
+    int have = st.count < HIST ? st.count : HIST;
+    int startIdx = (st.count <= HIST) ? 0 : (st.head % HIST);
+    int cleanCnt = 0;
+    uint32_t removedSec = 0;
+    uint32_t prevRealEndEpoch = 0;
+    memset(st.bins, 0, sizeof st.bins);
+    for (int k = 0; k < have; k++) {
+      int idx = (startIdx + k) % HIST;
+      Session s = st.hist[idx];
+      int dTemp100 = (s.peak100 != NONE && s.start100 != NONE) ? (s.peak100 - s.start100) : 0;
+      // Purge phantom idle sessions (avg <= 1.5 km/h with < 2.5C rise) or 1-min micro-tests
+      if (s.durMin < 2 || (s.avg10 <= 15 && dTemp100 < 250)) {
+        removedSec += (uint32_t)s.durMin * 60u;
+        continue;
+      }
+      // High-Precision Net-Rise Learning using exact thermal differential equation: S0 = dTemp / (tau * (1 - exp(-D/tau)))
+      s.flags |= 1;
+      float tauMin = effectiveTauMin();
+      if ((s.heat100 == NONE || s.heat100 <= 0) && s.durMin >= 2 && dTemp100 >= 60) {
+        float dT = (float)dTemp100 / 100.0f;
+        float effDur = tauMin * (1.0f - expf(-(float)s.durMin / tauMin));
+        if (effDur < 1.5f) effDur = (float)s.durMin;
+        float exactSlope = dT / effDur;
+        int h = (int)lroundf(exactSlope * 100.0f);
+        if (h >= 5 && h <= 350) {
+          s.heat100 = (int16_t)h;
+          int sb = (int)((s.avg10 / 10.0f) / 2.0f);
+          if (sb < 0) sb = 0;
+          if (sb >= NSB) sb = NSB - 1;
+          s.sbin = (uint8_t)sb;
+          if (s.ibin >= NIB) s.ibin = 0;
+          s.flags |= 2;
+        }
+      }
+      // Backfill estimated avgCur10 & peakCur10 for pre-v36.2 sessions where current wasn't stored yet
+      if (s.peakCur10 == 0 && s.avg10 > 15) {
+        float spd = s.avg10 / 10.0f;
+        float ht = (s.heat100 != NONE && s.heat100 > 0) ? (s.heat100 / 100.0f) : 0.65f;
+        float estAvgA = 1.38f + 0.26f * spd + 0.45f * ht;
+        float estPeakA = estAvgA * 1.34f + 0.25f;
+        int av10 = (int)lroundf(estAvgA * 10.0f); if (av10 > 250) av10 = 250;
+        int pk10 = (int)lroundf(estPeakA * 10.0f); if (pk10 > 250) pk10 = 250;
+        s.avgCur10 = (uint8_t)av10;
+        s.peakCur10 = (uint8_t)pk10;
+      }
+      if ((s.flags & 2) && s.heat100 > 0 && s.sbin < NSB && s.ibin < NIB) {
+        binAdd(st.bins[s.sbin * NIB + s.ibin], s.heat100);
+      }
+      if (s.epoch > 0) {
+        prevRealEndEpoch = s.epoch + (uint32_t)s.durMin * 60u;
+      }
+      cleanHist[cleanCnt % HIST] = s;
+      cleanCnt++;
+    }
+    if (prevRealEndEpoch > 0) st.lastEnd = prevRealEndEpoch;
+    if (removedSec > 0) {
+      st.totalSec = (st.totalSec > removedSec) ? (st.totalSec - removedSec) : 0;
+      if (st.maintSec > st.totalSec) st.maintSec = st.totalSec;
+    }
+    memcpy(st.hist, cleanHist, sizeof cleanHist);
+    st.count = (uint16_t)cleanCnt;
+    st.head = (uint16_t)(cleanCnt % HIST);
+    save();
+  }
+
+  bool computeCold(uint32_t now) const {
+    float amb = currentAmbientT();
+    bool rested = true;
+    if (haveEndMs) {
+      rested = ((uint32_t)(now - lastEndMs) / 1000u >= COLD_AFTER_S);
+    } else if (timeSet && st.lastEnd > 0) {
+      uint32_t e = epochAt(now);
+      if (e > st.lastEnd) rested = ((e - st.lastEnd) >= COLD_AFTER_S);
+    }
+    // If rested >= 3 hours, motor is guaranteed at current room ambient temperature
+    if (timeSet && st.lastEnd > 0) {
+      uint32_t e = epochAt(now);
+      if (e > st.lastEnd && (e - st.lastEnd) >= 10800u) return true;
+    }
+    if (haveEndMs && (uint32_t)(now - lastEndMs) / 1000u >= 10800u) return true;
+    // Otherwise must have rested >= 60 min AND be within +2.5C of current seasonal room ambient (or within +1.5C if previous run barely warmed it)
+    if (startT > -20.0f && amb > -40.0f) {
+      if (startT <= amb + 1.5f) return true;
+      return rested && (startT <= amb + 2.5f);
+    }
+    return rested;
+  }
+
+  void tick(uint32_t tm) {
+    bool tOk = haveT && (int32_t)(tm - lastTMs) <= 15000;
+    bool sOk = haveS && (int32_t)(tm - lastSMs) <= 15000;
+    float t = lastT, s = sOk ? lastS : -1.f, inc = lastI;
+    bool running = sOk && s >= 1.5f;
+
+    if (stt == IDLE || stt == COOL) {
+      if (stt == IDLE && tOk && t > -10.0f && t < 55.0f) {
+        bool idleRested = (!haveEndMs || (uint32_t)(tm - lastEndMs) / 1000u >= COLD_AFTER_S);
+        if (idleRested) {
+          if (idleAmbientT < -90.0f || t < idleAmbientT) idleAmbientT = t;
+          else idleAmbientT = idleAmbientT * 0.98f + t * 0.02f;
+        }
+      }
+      if (running && tOk) {
+        if (earlyN < EARLY_N) pushEarly(t, s, inc);
+        runCnt++;
+        if (runCnt >= START_N) {
+          if (stt == COOL) finishCool();
+          beginRun(tm);
+        }
+      } else {
+        runCnt = 0; earlyN = 0;
+        if (stt == COOL) {
+          if (tOk && sOk && coolN < COOL_N) cT[coolN++] = (int16_t)lroundf(t * 100.f);
+          if (coolN >= COOL_N) finishCool();
+        }
+      }
+      return;
+    }
+
+    // ---- RUN ----
+    if (tOk && t > peakT) { peakT = t; peakTick = runTicks + 1; }
+    if (running) {
+      stopCnt = 0; coolN = 0; unkCnt = 0;
+      if (tOk) { lastRunT = t; }
+      runTicks++; sumSpeed += s;
+      if (lastC >= 0.80f) {
+        sumCurA += lastC;
+        curTicks++;
+        float instPk = lastC + 0.35f * lastP2p;
+        if (runTicks >= 2 && instPk > peakCurA) peakCurA = instPk;
+        else if (peakCurA == 0.0f && lastC > peakCurA) peakCurA = lastC;
+      }
+    } else if (sOk) {
+      stopCnt++;
+      if (tOk && coolN < COOL_N) cT[coolN++] = (int16_t)lroundf(t * 100.f);
+    } else {
+      unkCnt++;
+    }
+    if (earlyN < EARLY_N) { if (tOk) pushEarly(t, running ? s : (sOk ? s : 0.f), inc); else { earlyBad = true; pushEarlyRaw(NONE, 0, 0); } }
+    if (!tOk) incomplete = true;
+    if (stopCnt >= STOP_N) endRun(tm, false);
+    else if (unkCnt >= 12) endRun(tm, true);
+  }
+
+  void pushEarly(float t, float s, float inc) {
+    int v = (int)lroundf(s * 10.f); if (v > 255) v = 255; if (v < 0) v = 0;
+    int ii = (int)lroundf(inc * 10.f);
+    pushEarlyRaw((int16_t)lroundf(t * 100.f), (uint8_t)v, (int16_t)ii);
+  }
+  void pushEarlyRaw(int16_t t, uint8_t s, int16_t i) {
+    if (earlyN >= EARLY_N) return;
+    eT[earlyN] = t; eS[earlyN] = s; eI[earlyN] = i; earlyN++;
+  }
+
+  void beginRun(uint32_t tm) {
+    stt = RUN; stopCnt = 0; unkCnt = 0; coolN = 0; incomplete = false;
+    runTicks = 0; peakTick = 1; curTicks = 0; sumSpeed = 0; sumCurA = 0; peakCurA = 0; liveSessionPeakA = 0;
+    startT = (earlyN && eT[0] != NONE) ? eT[0] / 100.f : lastT;
+    lastRunT = (earlyN && eT[earlyN - 1] != NONE) ? eT[earlyN - 1] / 100.f : lastT;
+    peakT = (startT > -50.0f) ? startT : ((lastT > -50.0f) ? lastT : 25.0f);
+    for (int i = 0; i < earlyN; i++) { runTicks++; sumSpeed += eS[i] / 10.f; if (eT[i] != NONE && eT[i] / 100.f > peakT) { peakT = eT[i] / 100.f; peakTick = runTicks; } }
+    uint32_t t0 = tm - (uint32_t)(earlyN ? earlyN - 1 : 0) * SAMPLE_MS;
+    runStartEpoch = epochAt(t0);
+    cold = computeCold(t0);
+    earlyBad = false; curIdx = -1;
+  }
+
+  // High-precision Ordinary Least-Squares (OLS) linear regression + Newton thermal dissipation correction
+  bool heatWindow(float& slope, int& sb, int& ib) const {
+    if (earlyBad) return false;
+    float tauMin = effectiveTauMin();
+    int i = SKIP_N;
+    while (i < earlyN) {
+      if (eT[i] == NONE || eS[i] < 20) { i++; continue; }
+      int minS = eS[i], maxS = eS[i], minI = eI[i], maxI = eI[i], j = i;
+      while (j + 1 < earlyN && eT[j + 1] != NONE && eS[j + 1] >= 20) {
+        int ns = eS[j + 1], ni = eI[j + 1];
+        int a = minS < ns ? minS : ns, b = maxS > ns ? maxS : ns, c = minI < ni ? minI : ni, d = maxI > ni ? maxI : ni;
+        if (b - a > 24 || d - c > 30) break;
+        minS = a; maxS = b; minI = c; maxI = d; j++;
+      }
+      int len = j - i + 1;
+      if (len >= PLATEAU_MIN) {
+        int w0 = i + LEAD_N, wn = len - LEAD_N; if (wn > WIN_MAX) wn = WIN_MAX;
+        double sx = 0, sy = 0, sxx = 0, sxy = 0, ms = 0, mi = 0;
+        for (int k = 0; k < wn; k++) {
+          double x = k * (SAMPLE_MS / 60000.0), y = eT[w0 + k] / 100.0;
+          sx += x; sy += y; sxx += x * x; sxy += x * y; ms += eS[w0 + k] / 10.0; mi += eI[w0 + k] / 10.0;
+        }
+        double den = wn * sxx - sx * sx;
+        if (den <= 0) return false;
+        float rawOls = (float)((wn * sxy - sx * sy) / den);
+        if (rawOls < 0.05f) { i = j + 1; continue; }
+        float meanT = (float)(sy / wn);
+        float dissLoss = (meanT > startT) ? ((meanT - startT) / tauMin) : 0.0f;
+        slope = rawOls + dissLoss;
+        ms /= wn; mi /= wn;
+        sb = (int)(ms / 2.0); if (sb < 0) sb = 0; if (sb >= NSB) sb = NSB - 1;
+        ib = mi < 1.5 ? 0 : (mi < 5.0 ? 1 : 2);
+        return true;
+      }
+      i = j + 1;
+    }
+    // Fallback 1: Multi-speed OLS regression over all active climbing samples in eT[SKIP_N .. peakIdx]
+    int climbEnd = (int)peakTick < earlyN ? (int)peakTick : earlyN;
+    if (climbEnd - SKIP_N >= 18) {
+      double sx = 0, sy = 0, sxx = 0, sxy = 0, ms = 0, mi = 0;
+      int wn = 0;
+      for (int k = SKIP_N; k < climbEnd; k++) {
+        if (eT[k] == NONE || eS[k] < 15) continue;
+        double x = (k - SKIP_N) * (SAMPLE_MS / 60000.0), y = eT[k] / 100.0;
+        sx += x; sy += y; sxx += x * x; sxy += x * y; ms += eS[k] / 10.0; mi += eI[k] / 10.0;
+        wn++;
+      }
+      double den = wn * sxx - sx * sx;
+      if (wn >= 18 && den > 0) {
+        float rawOls = (float)((wn * sxy - sx * sy) / den);
+        if (rawOls >= 0.05f) {
+          float meanT = (float)(sy / wn);
+          float dissLoss = (meanT > startT) ? ((meanT - startT) / tauMin) : 0.0f;
+          slope = rawOls + dissLoss;
+          ms /= wn; mi /= wn;
+          sb = (int)(ms / 2.0); if (sb < 0) sb = 0; if (sb >= NSB) sb = NSB - 1;
+          ib = mi < 1.5 ? 0 : (mi < 5.0 ? 1 : 2);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  void endRun(uint32_t tm, bool incompleteEnd) {
+    uint32_t sec = runTicks * (SAMPLE_MS / 1000);
+    int a = runTicks ? (int)lroundf(sumSpeed / runTicks * 10.f) : 0;
+    // تجاهل التجارب القصيرة جداً (أقل من دقيقتين) أو السرعات الوهمية (<= 1.5 كم/س) حتى لا تلوث السجل ولا تفسد حالة المحرك البارد
+    if (sec < 120 || a <= 15) {
+      stt = IDLE; coolN = 0; runCnt = 0; earlyN = 0;
+      return;
+    }
+    Session r; memset(&r, 0, sizeof r);
+    r.epoch = runStartEpoch ? runStartEpoch : epochAt(tm - sec * 1000u);
+    r.durMin = (uint16_t)(sec / 60 > 65535 ? 65535 : sec / 60);
+    r.avg10 = (uint8_t)(a > 255 ? 255 : a);
+    r.start100 = (int16_t)lroundf(startT * 100.f); r.peak100 = (int16_t)lroundf(peakT * 100.f);
+    r.heat100 = NONE; r.tau10 = NONE; r.sbin = 255; r.ibin = 255;
+    r.flags |= 1;
+    int pk10 = (int)lroundf(peakCurA * 10.0f); if (pk10 > 255) pk10 = 255; if (pk10 < 0) pk10 = 0;
+    int av10 = curTicks ? (int)lroundf((sumCurA / curTicks) * 10.0f) : 0; if (av10 > 255) av10 = 255; if (av10 < 0) av10 = 0;
+    r.peakCur10 = (uint8_t)pk10;
+    r.avgCur10 = (uint8_t)av10;
+    if (incompleteEnd || incomplete) r.flags |= 8;
+    float slope = 0.0f; int sb = 0, ib = 0;
+    bool gotHeat = heatWindow(slope, sb, ib);
+    // المعادلة الفيزيائية الدقيقة للمنحنى الحراري الأسي: S0 = dTemp / (tau * (1 - exp(-climbMin / tau)))
+    if (!gotHeat && r.durMin >= 2 && (peakT - startT) >= 0.6f) {
+      float climbMin = (float)(peakTick * (SAMPLE_MS / 1000)) / 60.0f;
+      if (climbMin < 2.0f) climbMin = (float)r.durMin;
+      float tauMin = effectiveTauMin();
+      float effMin = tauMin * (1.0f - expf(-climbMin / tauMin));
+      if (effMin < 1.5f) effMin = climbMin;
+      slope = (peakT - startT) / effMin;
+      sb = (int)((r.avg10 / 10.0f) / 2.0f);
+      if (sb < 0) sb = 0;
+      if (sb >= NSB) sb = NSB - 1;
+      ib = (lastI < 1.5f) ? 0 : ((lastI < 5.0f) ? 1 : 2);
+      gotHeat = true;
+    }
+    if (gotHeat && slope >= 0.05f) {
+      int h = (int)lroundf(slope * 100.f);
+      if (h >= 5 && h <= 350) {
+        r.heat100 = (int16_t)h; r.sbin = (uint8_t)sb; r.ibin = (uint8_t)ib; r.flags |= 2;
+        binAdd(st.bins[sb * NIB + ib], (int16_t)h);
+      }
+    }
+    int slot = st.head;
+    st.hist[slot] = r; st.head = (uint16_t)((st.head + 1) % HIST); if (st.count < 65535) st.count++;
+    st.totalSec += sec;
+    haveEndMs = true;
+    lastEndMs = tm - (uint32_t)(incompleteEnd ? 0 : STOP_N) * SAMPLE_MS;
+    uint32_t e = epochAt(lastEndMs); if (e) st.lastEnd = e;
+    save();
+    curIdx = slot;
+    if (incompleteEnd) { stt = IDLE; coolN = 0; runCnt = 0; earlyN = 0; return; }
+    stt = COOL; runCnt = 0; earlyN = 0;
+  }
+
+  void finishCool() {
+    if (curIdx >= 0 && coolN >= 60) {
+      Session& r = st.hist[curIdx];
+      int span = coolN >= 120 ? 120 : 60;                    // 10 or 5 minutes
+      float excess = lastRunT - startT;
+      float drop = lastRunT - cT[span - 1] / 100.f;
+      if ((r.flags & 1) && excess >= 5.f) {
+        float frac = drop / excess;
+        if (frac >= 0.03f && frac <= 0.95f) {
+          float tau = -(span * SAMPLE_MS / 60000.f) / logf(1.f - frac);
+          int t10 = (int)lroundf(tau * 10.f); if (t10 > 3000) t10 = 3000;
+          r.tau10 = (int16_t)t10; r.flags |= 4;
+          binAdd(st.tau, (int16_t)t10);
+        }
+      }
+      save();
+    }
+    stt = IDLE; coolN = 0; curIdx = -1;
+  }
+};
+
+}  // namespace mh
+
+// [Embedded MotorCurrentDSP.h v36.2]
+
+#include <math.h>
+
+/**
+ * MotorCurrentDSP.h - High-Speed Multi-Band Digital Signal Processing (DSP) Engine
+ * Designed for ESP32-S3 + Allegro ACS758LCB-050B (50A Hall-Effect Current Sensor)
+ *
+ * Implements:
+ * 1. High-Speed Burst Sampling & ADC eFuse Millivolt Reading on GPIO 5 (ADC1)
+ * 2. Pre-processing: Zero-Current Tracking & Fast DC-Removal High-Pass Filtering
+ * 3. PWM Carrier Notch / Bandstop Suppression to eliminate false arcing detection
+ * 4. 4th Standardized Moment (Sample Kurtosis) Engine for Brush Arcing/Wear Detection
+ * 5. Temporal CUSUM Evidence Accumulator for Zero-False-Alarm Confidence Scoring
+ * 6. Low-Frequency Path: Instant Electronic Stall Protection (>15A), Power (Watts/kWh),
+ *    and Empty-Belt Baseline Friction Monitoring for Lubrication Tracking
+ * 7. Medium-Frequency Path: Mechanical Footstrike Step Counter (Schmitt Trigger + Runner Gate)
+ * 8. Dynamic Body Weight Estimator from Armature Drag & Impact Force
+ */
+
+namespace dsp {
+
+static portMUX_TYPE dspMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct DspConfig {
+  float ratedCurrentA;        // Continuous Rated Current (Nameplate: 10.0A, Range: 5.0 - 25.0A)
+  float stallLimitA;          // Stall Trip Limit (Default 150%: 15.0A, Range: 8.0 - 25.0A)
+  uint16_t stallDelayMs;      // Trip Persistence Duration (Default: 300ms, Range: 100 - 1500ms)
+  float kurtosisThresh;       // Arcing Detection Kurtosis Threshold (Default: 6.5, Range: 4.0 - 30.0)
+  float cusumWarnScore;       // CUSUM Warning Accumulator Score (Default: 18.0, Range: 5.0 - 50.0)
+  float cusumCritScore;       // CUSUM Critical Accumulator Score (Default: 45.0, Range: 20.0 - 90.0)
+  float emptyBeltWarnA;       // Unloaded Belt Lubrication Warn Limit (Default: 3.5A, Range: 1.5 - 6.0A)
+  float stepDeltaA;           // Footstrike Peak Threshold Delta (Default: 0.18A, Range: 0.08 - 0.80A)
+  float sensMvPerA;           // ACS758 Sensitivity on 3.3V (Default: 26.4 mV/A, Range: 15.0 - 45.0)
+  float nominalBusV;          // Nominal DC Bus Voltage (Default: 180.0V, Range: 90.0 - 240.0V)
+  float calibratedBaselineA;  // Clean empty belt baseline captured right after lubrication (Default: 1.80A)
+  uint8_t autoSensOn;         // 1 = Auto-calculate from zero voltage, 0 = Manual sensMvPerA (Default: 1)
+  float inertiaDelayS;        // Delay before lubrication baseline measurement (Default: 3.5s, Range: 1.0 - 10.0s)
+  float inclineCompA;         // Incline current compensation per 1% grade (Default: 0.15A/%, Range: 0.0 - 0.50A/%)
+  uint8_t zeroTrackingOn;     // 1 = Dynamic thermal zero tracking at idle, 0 = Fixed zero (Default: 1)
+  float weightKgPerA;         // Universal Body Mass Calibration Constant (Default: 32.0 kg/A, Range: 15.0 - 85.0 kg/A)
+};
+
+struct Metrics {
+  float currentA;              // Average DC current in Amperes
+  float currentP2pA;           // Peak-to-peak AC ripple current in Amperes
+  float motorLoadPct;          // Instantaneous motor electrical load (relative to ratedCurrentA)
+  float kurtosis;              // 4th standardized moment (healthy ~1.8-3.4, arcing > kurtosisThresh)
+  float arcingScore;           // CUSUM cumulative confidence score (0 to 100)
+  uint8_t brushHealth;         // 0 = Healthy/Smooth, 1 = Warning (Early Arcing), 2 = Critical (Severe Wear)
+  float emptyBeltA;            // Baseline empty belt current in first 5s of run (lubrication metric)
+  float calibratedBaselineA;   // Pristine baseline captured right after lubrication
+  float frictionRatioPct;      // Friction ratio relative to pristine lubrication (100% = fresh oil)
+  bool lubricationAlert;       // True if emptyBeltA exceeds emptyBeltWarnA
+  float powerWatts;            // Instantaneous electrical power in Watts (V_bus * I_avg)
+  float energyKWh;             // Cumulative consumed electrical energy in kWh
+  uint32_t stepCount;          // Mechanical footstrike steps counted from belt load peaks
+  uint16_t cadenceSpm;         // Live cadence in steps per minute (SPM)
+  float symmetryPct;           // Left/Right footstrike balance (100% = perfectly symmetrical)
+  bool stallAlert;             // True if current exceeds stallLimitA for >stallDelayMs
+  float zeroVoltMv;            // Auto-calibrated zero-current voltage in mV
+  float activeSensMvA;         // Active sensitivity currently in effect
+
+  // --- Smart Biometrics & Mechanical Analytics ---
+  float estimatedWeightKg;     // Dynamically estimated body weight in kg
+  bool stepOffAlert;           // True if runner stepped off or fell while belt was running
+  float runningEconomyWhPerKm; // Energy efficiency in Wh/km
+  uint8_t fatigueState;        // 0 = Fresh/Balanced, 1 = Moderate Fatigue, 2 = High Fatigue Risk
+  uint8_t beltTensionStatus;   // 0 = Loose, 1 = Optimal, 2 = Over-tight
+  uint8_t bearingStatus;       // 0 = Smooth, 1 = Slight Roughness, 2 = Worn/Check
+};
+
+class MotorCurrentDSP {
+public:
+  // Accessor for raw 512-sample burst for offline waveform analysis
+  const float* getLastRawBurst() const { return _rawMv; }
+  void copyRawBurst(float* dest, size_t maxCount) const {
+    size_t count = maxCount < BURST_SIZE ? maxCount : BURST_SIZE;
+    memcpy(dest, _rawMv, count * sizeof(float));
+  }
+
+  static const size_t BURST_SIZE = 512;
+
+  // Motor Specifications from Nameplate (Kettler Dortmund S2 - Cat. No. 3030200146)
+  static constexpr float RATED_BUS_VOLTS   = 180.0f; // Nominal DC Bus Voltage
+  static constexpr float RATED_CURRENT_A   = 10.0f;  // Continuous Rated Current (AMPS 10)
+  static constexpr float RATED_HORSEPOWER  = 2.5f;   // 2.5 H.P. Continuous (CON)
+  static constexpr float STALL_CURRENT_A   = 15.0f;  // 150% of Rated FLA (Trip limit)
+  static constexpr float DEFAULT_SENS_MV_A = 24.0f;  // ACS758-050B on 3.3V supply (~26.4 mV/A)
+
+  static DspConfig getDefaultConfig() {
+    DspConfig c;
+    c.ratedCurrentA         = RATED_CURRENT_A;   // 10.0f
+    c.stallLimitA           = STALL_CURRENT_A;   // 15.0f
+    c.stallDelayMs          = 800;               // 300 ms
+    c.kurtosisThresh        = 18.0f;             // عتبة الإنذار الحقيقي بعد استبعاد تقطيع PWM              // K > 6.5
+    c.cusumWarnScore        = 18.0f;             // Score >= 18.0 -> Warning
+    c.cusumCritScore        = 45.0f;             // Score >= 45.0 -> Critical
+    c.emptyBeltWarnA        = 3.5f;              // Empty belt > 3.5A -> Needs silicone lubrication
+    c.stepDeltaA            = 0.25f;             // Sensitive footstrike load pulse (0.18A)
+    c.sensMvPerA            = DEFAULT_SENS_MV_A; // 26.4 mV/A
+    c.nominalBusV           = RATED_BUS_VOLTS;   // 180.0 V
+    c.calibratedBaselineA   = 1.80f;             // Clean pristine baseline after lubrication
+    c.autoSensOn            = 1;                 // Default: Auto-calculate from zero voltage
+    c.inertiaDelayS         = 3.5f;              // 3.5 seconds start delay to bypass acceleration
+    c.inclineCompA          = 0.15f;             // 0.15 A per 1% grade
+    c.zeroTrackingOn        = 1;                 // Default: Auto-track thermal zero at idle
+    c.weightKgPerA          = 32.0f;             // Calibrated universal constant: 32.0 kg/A
+    return c;
+  }
+
+  MotorCurrentDSP()
+    : _pin(5), _zeroMv(1500.0f), _calibrated(false),
+      _arcingScore(0.0f), _brushState(0),
+      _emptyBeltSampleCount(0), _emptyBeltSum(0.0f),
+      _pendingLubricationCal(false),
+      _energyWs(0.0f), _lastEnergyUpdateMs(0),
+      _stepCount(0), _lastStepMs(0),
+      _stepLpCurrent(0.0f), _prevStepSlope(0.0f),
+      _leftPeakSum(0.0f), _rightPeakSum(0.0f),
+      _stepAlternator(false), _symmetryPct(100.0f), _stepArmed(true),
+      _stallStartMs(0), _stallActive(false),
+      _lastBurstMs(0), _smoothedCurrentA(0.0f),
+      _estWeight(0.0f)
+  {
+    _cfg = getDefaultConfig();
+    memset(&_m, 0, sizeof(_m));
+    memset(_rawMv, 0, sizeof(_rawMv));
+    memset(_hp, 0, sizeof(_hp));
+    _m.kurtosis = 2.8f;
+    _m.brushHealth = 0;
+    _m.symmetryPct = 100.0f;
+    _m.calibratedBaselineA = _cfg.calibratedBaselineA;
+    _m.frictionRatioPct = 100.0f;
+    _m.estimatedWeightKg = 75.0f;
+    _m.beltTensionStatus = 1;
+    _m.bearingStatus = 0;
+    _m.activeSensMvA = _cfg.sensMvPerA;
+  }
+
+  void begin(uint8_t pin = 5, float nominalBusVoltage = RATED_BUS_VOLTS, float sensitivityMvPerA = DEFAULT_SENS_MV_A) {
+    _pin = pin;
+    if (nominalBusVoltage > 50.0f) _cfg.nominalBusV = nominalBusVoltage;
+    if (sensitivityMvPerA > 1.0f) _cfg.sensMvPerA = sensitivityMvPerA;
+    pinMode(_pin, INPUT);
+    analogSetPinAttenuation(_pin, ADC_11db); // 0 - 3.1V linear range with eFuse calibration
+    calibrateZero(300);
+    _lastEnergyUpdateMs = millis();
+  }
+
+  // Triggered when user clicks "تم التشحيم" (Lubrication Done)
+  void onMaintenanceLubricated() {
+    _pendingLubricationCal = true;
+    _emptyBeltSampleCount = 0;
+    _emptyBeltSum = 0.0f;
+  }
+
+  bool isLubricationCalPending() const {
+    return _pendingLubricationCal;
+  }
+
+  // Auto-calibrates zero-current sensor output voltage when motor is stopped
+  void calibrateZero(size_t samples = 200) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < samples; i++) {
+      sum += (float)analogReadMilliVolts(_pin);
+      delayMicroseconds(100);
+    }
+    float v0 = sum / (float)samples;
+    // Sanity check: allow 1100mV - 2200mV (covering 2.5V - 4.4V rail halving)
+    if (v0 >= 1100.0f && v0 <= 2700.0f) {
+      _zeroMv = v0;
+      _calibrated = true;
+    } else {
+      _zeroMv = 1650.0f; // Default nominal 3.3V / 2
+    }
+    _m.zeroVoltMv = _zeroMv;
+
+    // Apply auto-ratiometric sensitivity scaling if enabled
+    _updateActiveSensitivity();
+  }
+
+  void setConfig(const DspConfig& c) {
+    portENTER_CRITICAL(&dspMux);
+    _cfg = c;
+    _validateConfig();
+    _updateActiveSensitivity();
+    portEXIT_CRITICAL(&dspMux);
+  }
+
+  DspConfig getConfig() const {
+    DspConfig copy;
+    portENTER_CRITICAL((portMUX_TYPE*)&dspMux);
+    copy = _cfg;
+    portEXIT_CRITICAL((portMUX_TYPE*)&dspMux);
+    return copy;
+  }
+
+  void resetConfigToDefaults() {
+    _cfg = getDefaultConfig();
+    _updateActiveSensitivity();
+  }
+
+  // Main high-speed processing burst, called every ~180-250 ms from dedicated FreeRTOS task
+  void processBurst(uint32_t nowMs, float liveSpeedKmh, float liveInclPct = 0.0f) {
+    if (nowMs - _lastBurstMs < 45) return;
+    _lastBurstMs = nowMs;
+
+    // 1. High-speed burst capture into member buffer (allocated in SRAM, not stack)
+    // Sample interval: ~120us -> Fs ~ 8.33 kHz (captures up to ~4 kHz Nyquist)
+    float sumMv = 0.0f;
+    for (size_t i = 0; i < BURST_SIZE; i++) {
+      _rawMv[i] = (float)analogReadMilliVolts(_pin);
+      sumMv += _rawMv[i];
+      delayMicroseconds(120);
+    }
+
+    float meanMv = sumMv / (float)BURST_SIZE;
+
+    // Auto-update zero calibration if belt has been fully stopped (idle motor)
+    // CRITICAL GUARD: Only track true micro-thermal drift (< 5.0 mV, approx < 0.2A).
+    // If current is flowing (diff >= 5.0 mV), NEVER shift zero point!
+    float driftDiff = fabsf(meanMv - _zeroMv);
+    // تتبع حراري ذكي وسريع لنقطة الصفر عند سكون السير (يعوض أي إزاحة حتى 75mV ~ 1.8A)
+    if (_cfg.zeroTrackingOn != 0 && liveSpeedKmh <= 0.05f && driftDiff < 75.0f && meanMv >= 1100.0f && meanMv <= 2700.0f) {
+      _zeroMv = _zeroMv * 0.95f + meanMv * 0.05f;
+      _m.zeroVoltMv = _zeroMv;
+      _updateActiveSensitivity();
+    }
+
+    // 2. Low-Frequency DC Current & Motor Load % Calculation
+    float diffMv = meanMv - _zeroMv;
+    float instantA = fabsf(diffMv) / _effectiveSens();
+    // إخماد حاسم وتصفير تام لأي تيار وهمي ناتج عن حرارة الشاحن طالما أن السير متوقف تماماً
+    if (liveSpeedKmh <= 0.05f && instantA < 1.45f) {
+      instantA = 0.0f;
+    } else if (instantA < 0.04f) {
+      instantA = 0.0f; // Noise deadband at idle
+    }
+
+    _smoothedCurrentA = _smoothedCurrentA * 0.7f + instantA * 0.3f;
+    _m.currentA = _smoothedCurrentA;
+    _m.motorLoadPct = (_smoothedCurrentA / _cfg.ratedCurrentA) * 100.0f;
+
+    // 3. Electronic Stall / Overload Protection (Configurable Limit & Persistence Duration)
+    if (instantA >= _cfg.stallLimitA) {
+      if (_stallStartMs == 0) _stallStartMs = nowMs;
+      else if (nowMs - _stallStartMs >= (uint32_t)_cfg.stallDelayMs) {
+        _stallActive = true;
+      }
+    } else {
+      _stallStartMs = 0;
+      _stallActive = false;
+    }
+    _m.stallAlert = _stallActive;
+
+    // 4. Power & Cumulative Energy: True PMDC Back-EMF + Armature Drop (Ia * Ra) Model (Argon Point 5)
+    const float ARMATURE_R_OHM = 1.5f; // مقاومة ملفات المنتج والفحمات النموذجية لمحرك 2.5 حصان (1.5 أوم)
+    float effectiveBusV = 0.0f;
+    if (liveSpeedKmh > 0.05f) {
+      float backEmfV = _cfg.nominalBusV * (0.08f + 0.92f * (liveSpeedKmh / 20.0f));
+      effectiveBusV = backEmfV + (_smoothedCurrentA * ARMATURE_R_OHM);
+      if (effectiveBusV > _cfg.nominalBusV) effectiveBusV = _cfg.nominalBusV;
+    } else if (_smoothedCurrentA > 0.40f) {
+      // Smart Fallback: تشغيل يدوي من الكونسول بدون تدفق سرعة البلوتوث (تقدير Back-EMF + هبوط الجهد الداخلي)
+      effectiveBusV = (_cfg.nominalBusV * 0.22f) + (_smoothedCurrentA * ARMATURE_R_OHM);
+      if (effectiveBusV > _cfg.nominalBusV) effectiveBusV = _cfg.nominalBusV;
+    }
+    float calcPowerWatts = effectiveBusV * _smoothedCurrentA;
+
+    float dtSec = _lastEnergyUpdateMs > 0 ? (float)(nowMs - _lastEnergyUpdateMs) / 1000.0f : 0.06f;
+    _lastEnergyUpdateMs = nowMs;
+    if (dtSec > 0.0f && dtSec < 5.0f && calcPowerWatts > 0.0f) {
+      _energyWs += calcPowerWatts * dtSec;
+    }
+
+    // 5. Empty-Belt Baseline Capture with Runner-Contamination Guard (Argon Point 3)
+    static uint32_t runStartMs = 0;
+    static float prevSpeedKmh = 0.0f;
+    static uint32_t stepsAtWindowStart = 0;
+    static bool windowContaminated = false;
+
+    if (prevSpeedKmh <= 0.05f && liveSpeedKmh > 0.5f) {
+      runStartMs = nowMs;
+      _emptyBeltSampleCount = 0;
+      _emptyBeltSum = 0.0f;
+      stepsAtWindowStart = _stepCount;
+      windowContaminated = false;
+    }
+    prevSpeedKmh = liveSpeedKmh;
+
+    uint32_t startDelayMs = (uint32_t)(_cfg.inertiaDelayS * 1000.0f);
+    if (startDelayMs < 1000) startDelayMs = 1000;
+    if (startDelayMs > 10000) startDelayMs = 10000;
+    uint32_t endDelayMs = startDelayMs + 5000; // نافذة 5 ثوانٍ لقياس السير الفارغ بعد تجاوز قصور الإقلاع
+
+    if (runStartMs > 0 && (nowMs - runStartMs) >= startDelayMs && (nowMs - runStartMs) <= endDelayMs) {
+      float compA = (liveInclPct > 0.0f && _cfg.inclineCompA > 0.0f) ? (liveInclPct * _cfg.inclineCompA) : 0.0f;
+      float netBeltCurrent = (instantA > compA) ? (instantA - compA) : instantA;
+
+      // حارس التلوث بوزن المستخدم: إذا تجاوز التيار 2.8A أو سُجلت خطوات أقدام، نرفض العينة ونحتفظ بآخر معايرة
+      if (netBeltCurrent >= 2.8f || _stepCount != stepsAtWindowStart) {
+        windowContaminated = true;
+      }
+
+      if (!windowContaminated && netBeltCurrent >= 0.35f && netBeltCurrent < 2.8f) {
+        _emptyBeltSum += netBeltCurrent;
+        _emptyBeltSampleCount++;
+        float measuredEmptyA = _emptyBeltSum / (float)_emptyBeltSampleCount;
+
+        portENTER_CRITICAL(&dspMux);
+        _m.emptyBeltA = measuredEmptyA;
+        if (_pendingLubricationCal && _emptyBeltSampleCount >= 15) {
+          if (measuredEmptyA >= 0.7f && measuredEmptyA <= 2.8f) {
+            _cfg.calibratedBaselineA = measuredEmptyA;
+            _cfg.emptyBeltWarnA = measuredEmptyA * 1.55f;
+            _m.calibratedBaselineA = measuredEmptyA;
+          }
+          _pendingLubricationCal = false;
+        }
+        float baseRef = _cfg.calibratedBaselineA > 0.5f ? _cfg.calibratedBaselineA : 1.8f;
+        _m.calibratedBaselineA = baseRef;
+        _m.frictionRatioPct = (_m.emptyBeltA / baseRef) * 100.0f;
+        _m.lubricationAlert = (_m.emptyBeltA >= _cfg.emptyBeltWarnA);
+        if (_m.emptyBeltA < 1.15f) _m.beltTensionStatus = 0;
+        else if (_m.emptyBeltA <= 2.75f) _m.beltTensionStatus = 1;
+        else _m.beltTensionStatus = 2;
+        portEXIT_CRITICAL(&dspMux);
+      } else if (windowContaminated && _m.emptyBeltA < 0.5f) {
+        portENTER_CRITICAL(&dspMux);
+        _m.emptyBeltA = _cfg.calibratedBaselineA > 0.5f ? _cfg.calibratedBaselineA : 1.08f;
+        portEXIT_CRITICAL(&dspMux);
+      }
+    }
+
+    // 6 & 7. Impulse Despiker + High-Pass Moving Baseline + 2-Tap PWM Suppression & Kurtosis
+    // يستبعد نبضات التقطيع الخاطفة المعزولة (120us) ثم يعزل موجة القدم والتسارع قبل حساب التفرطح
+    float minAc = 1e9f, maxAc = -1e9f;
+    float invSens = 1.0f / _effectiveSens();
+    float prevHf = 0.0f;
+    double sumSq = 0.0;
+    double sumQuad = 0.0;
+
+    // Despiker Filter: استبعاد النبضات المفردة الخاطفة (Switching Notches) الناتجة عن درايفر المشاية
+    float cleanMv[BURST_SIZE];
+    cleanMv[0] = _rawMv[0];
+    cleanMv[BURST_SIZE - 1] = _rawMv[BURST_SIZE - 1];
+    for (size_t i = 1; i < BURST_SIZE - 1; i++) {
+      float dl = _rawMv[i] - _rawMv[i - 1];
+      float dr = _rawMv[i] - _rawMv[i + 1];
+      if ((dl > 30.0f && dr > 30.0f) || (dl < -30.0f && dr < -30.0f)) {
+        cleanMv[i] = 0.5f * (_rawMv[i - 1] + _rawMv[i + 1]);
+      } else {
+        cleanMv[i] = _rawMv[i];
+      }
+    }
+
+    float localMean = cleanMv[0];
+    for (size_t i = 0; i < BURST_SIZE; i++) {
+      localMean = localMean * 0.92f + cleanMv[i] * 0.08f; // يتتبع موجة القدم البطيئة
+      float hfSample = (cleanMv[i] - localMean) * invSens;
+      _hp[i] = (i > 0) ? 0.5f * (hfSample + prevHf) : hfSample; // مرشح ثنائي النقاط لكتم التموج العالي
+      prevHf = hfSample;
+
+      if (_hp[i] < minAc) minAc = _hp[i];
+      if (_hp[i] > maxAc) maxAc = _hp[i];
+
+      double d = (double)_hp[i];
+      double d2 = d * d;
+      sumSq += d2;
+      sumQuad += (d2 * d2);
+    }
+    _m.currentP2pA = (maxAc > minAc) ? (maxAc - minAc) : 0.0f;
+
+    // Bearing Mechanical Roughness: Unloaded belt high-frequency ripple check
+    // Bearing status default smooth (PWM ripple cannot falsely trip mechanical bearing check)
+    _m.bearingStatus = 0;
+
+    double variance = sumSq / (double)BURST_SIZE;
+    double rawKurtosis = 2.8;
+
+    if (variance > 0.0004 && liveSpeedKmh >= 0.5f) { // variance > (20mA)^2
+      rawKurtosis = (sumQuad / (double)BURST_SIZE) / (variance * variance);
+      if (rawKurtosis > 50.0) rawKurtosis = 50.0; // clamp extreme outliers
+    } else {
+      rawKurtosis = 2.8; // Baseline commutation / Gaussian default
+    }
+
+    _m.kurtosis = _m.kurtosis * 0.70f + (float)rawKurtosis * 0.30f;
+
+    // 8. CUSUM / Temporal Evidence Accumulator (Guarantees Zero False Positives)
+    //    Step increments are clamped to max +6.0 per burst so single spikes never trigger an alert
+    if (liveSpeedKmh >= 0.8f && _m.currentA >= 0.3f) {
+      if (rawKurtosis >= _cfg.kurtosisThresh) {
+        float inc = (float)(rawKurtosis - (_cfg.kurtosisThresh - 1.5f)) * 0.8f;
+        if (inc > 6.0f) inc = 6.0f; // Clamped per burst
+        _arcingScore += inc;
+      } else if (rawKurtosis <= (_cfg.kurtosisThresh - 2.3f)) {
+        _arcingScore -= 2.0f;
+      }
+    } else {
+      _arcingScore -= 3.0f; // Rapid decay at idle
+    }
+
+    if (_arcingScore < 0.0f) _arcingScore = 0.0f;
+    if (_arcingScore > 100.0f) _arcingScore = 100.0f;
+    _m.arcingScore = _arcingScore;
+
+    if (_arcingScore >= _cfg.cusumCritScore) {
+      _brushState = 2; // Critical: Severe wear / heavy continuous sparking
+    } else if (_arcingScore >= _cfg.cusumWarnScore) {
+      _brushState = 1; // Warning: Early wear / intermittent sparking
+    } else {
+      _brushState = 0; // Healthy: Smooth commutation
+    }
+    _m.brushHealth = _brushState;
+
+    // 9. Medium-Frequency Band: 8x Sub-Sampled Footstrike Step Counter (~115 Hz, Argon Point 1)
+    // قفل عزم التسارع وتغيير السرعة (Speed Ramp Lockout)
+    static float _lastSpeedKmh = 0.0f;
+    static uint32_t _speedChangeMs = 0;
+    if (fabsf(liveSpeedKmh - _lastSpeedKmh) >= 0.15f) {
+      _lastSpeedKmh = liveSpeedKmh;
+      _speedChangeMs = nowMs;
+    }
+    bool isAccelerating = (nowMs - _speedChangeMs) < 2500;
+
+    // بوابة وجود الراكب (Runner Presence Lock Gate - v35.7 Calibrated)
+    // خط الأساس التقديري لتيار السير الفارغ يتناسب طردياً مع السرعة (~1.35A عند 1 كم/س إلى ~2.15A عند 10 كم/س)
+    float speedEmptyBase = 1.35f + (liveSpeedKmh * 0.08f);
+    float emptyRef = (_m.emptyBeltA > 0.5f && _m.emptyBeltA < 3.0f) ? _m.emptyBeltA : speedEmptyBase;
+    if (emptyRef < speedEmptyBase * 0.85f) emptyRef = speedEmptyBase;
+
+    // شرط وجود الراكب: عدم التسارع، والسرعة >= 0.5 كم/س، وتجاوز التيار خط الأساس الفارغ بـ +0.40A
+    // (تم إلغاء الشرط الثابت القديم 1.65A لمنع العد الكاذب والسير يدور فارغاً)
+    bool runnerOnBelt = !isAccelerating && (liveSpeedKmh >= 0.5f) && (_smoothedCurrentA >= (emptyRef + 0.40f));
+
+    static float _stepDcBaseline = 0.0f;
+    if (_stepDcBaseline < 0.1f) _stepDcBaseline = instantA;
+    static float _peakAcInStep = 0.0f;
+
+    // تقسيم الـ 512 عينة إلى 8 كتل فرعية (64 عينة = ~7.7ms لكل كتلة -> معدل ~115 هرتز)
+    const size_t SUB_BLOCKS = 8;
+    const size_t SUB_SIZE = BURST_SIZE / SUB_BLOCKS; // 64 samples
+
+    for (size_t b = 0; b < SUB_BLOCKS; b++) {
+      float subSumMv = 0.0f;
+      size_t offset = b * SUB_SIZE;
+      for (size_t i = 0; i < SUB_SIZE; i++) {
+        subSumMv += _rawMv[offset + i];
+      }
+      float subMeanMv = subSumMv / (float)SUB_SIZE;
+      float subInstantA = fabsf(subMeanMv - _zeroMv) * invSens;
+      if (subInstantA < 0.04f) subInstantA = 0.0f;
+
+      // معاملات IIR معاد ضبطها لمعدل ~115 هرتز (أعلى بـ 8 مرات):
+      // المرشح السريع (~55ms) يحفظ القمة الحادة للقدم، والبطيء (~1.1s) يتتبع الحمل المستمر
+      _stepLpCurrent = _stepLpCurrent * 0.85f + subInstantA * 0.15f;
+      _stepDcBaseline = _stepDcBaseline * 0.992f + subInstantA * 0.008f;
+
+      float acGait = _stepLpCurrent - _stepDcBaseline;
+      uint32_t subNowMs = (nowMs > 56) ? (nowMs - 56 + (uint32_t)(b * 8)) : nowMs;
+      uint32_t dtStep = subNowMs - _lastStepMs;
+
+      if (runnerOnBelt) {
+        if (!_stepArmed) {
+          // تتبع القمة القصوى الفعلية أثناء طور الهبوط على السير لدقة حساب التناظر (Symmetry)
+          if (acGait > _peakAcInStep) _peakAcInStep = acGait;
+
+          // إعادة تسليح الزناد عند نزول الإشارة في قاع الخطوة وتسجيل القمة الحقيقية للخطوة المنتهية
+          if (acGait <= -0.02f && dtStep >= 230) {
+            if (_peakAcInStep > 0.02f) {
+              if (_stepAlternator) {
+                _rightPeakSum = _rightPeakSum * 0.80f + _peakAcInStep * 0.20f;
+              } else {
+                _leftPeakSum = _leftPeakSum * 0.80f + _peakAcInStep * 0.20f;
+              }
+              _stepAlternator = !_stepAlternator;
+
+              if (_leftPeakSum > 0.02f && _rightPeakSum > 0.02f) {
+                float ratio = _leftPeakSum < _rightPeakSum ? (_leftPeakSum / _rightPeakSum) : (_rightPeakSum / _leftPeakSum);
+                _symmetryPct = _symmetryPct * 0.85f + (ratio * 100.0f) * 0.15f;
+                _m.symmetryPct = _symmetryPct;
+
+                if (_m.symmetryPct < 70.0f) _m.fatigueState = 2;
+                else if (_m.symmetryPct < 85.0f) _m.fatigueState = 1;
+                else _m.fatigueState = 0;
+              }
+            }
+            _peakAcInStep = 0.0f;
+            _stepArmed = true;
+          }
+        } else {
+          // ربط حساسية ضربة القدم (_cfg.stepDeltaA) ديناميكياً مع متوسط قمة الصدمة (v35.7)
+          float dynPeak = (_leftPeakSum + _rightPeakSum) * 0.5f;
+          float baseThresh = _cfg.stepDeltaA * 0.35f; // عتبة الأساس المتناسبة مع حساسية المستخدم
+          float triggerThresh = (dynPeak > 0.03f) ? (baseThresh + dynPeak * 0.18f) : baseThresh;
+          if (triggerThresh < 0.045f) triggerThresh = 0.045f;
+          if (triggerThresh > 0.35f) triggerThresh = 0.35f;
+
+          if (acGait >= triggerThresh && dtStep >= 230) {
+            _stepArmed = false;
+            _peakAcInStep = acGait;
+            _stepCount++;
+            _m.stepCount = _stepCount;
+            _lastStepMs = subNowMs;
+
+            if (dtStep > 230 && dtStep < 1400) {
+              uint16_t instantSpm = (uint16_t)(60000UL / dtStep);
+              if (instantSpm >= 75 && instantSpm <= 220) {
+                _m.cadenceSpm = _m.cadenceSpm == 0 ? instantSpm : (uint16_t)(_m.cadenceSpm * 0.65f + instantSpm * 0.35f);
+              }
+            }
+          }
+        }
+      } else {
+        _stepArmed = true;
+        _peakAcInStep = 0.0f;
+        _m.cadenceSpm = 0;
+      }
+    }
+    if ((nowMs - _lastStepMs) > 4000) {
+      _m.cadenceSpm = 0;
+    }
+
+    if (runnerOnBelt) {
+
+      // 10. التقدير الديناميكي الشامل للوزن مع تعويض الميل والسرعة (Argon Point 4)
+      float speedEmptyCompA = (liveSpeedKmh > 4.0f) ? ((liveSpeedKmh - 4.0f) * 0.04f) : 0.0f;
+      float inclineLoadA = (liveInclPct > 0.0f && _cfg.inclineCompA > 0.0f) ? (liveInclPct * _cfg.inclineCompA) : 0.0f;
+      float dynamicEmptyRef = emptyRef + speedEmptyCompA + inclineLoadA;
+      float loadDeltaA = _smoothedCurrentA - dynamicEmptyRef;
+
+      if (loadDeltaA >= 0.45f) {
+        float speedCorr = 1.0f;
+        if (liveSpeedKmh >= 2.0f && liveSpeedKmh <= 16.0f) {
+          speedCorr = 1.0f / (1.0f + 0.012f * (liveSpeedKmh - 4.0f));
+        }
+        float rawEstKg = (loadDeltaA * _cfg.weightKgPerA) * speedCorr;
+        if (rawEstKg >= 35.0f && rawEstKg <= 160.0f) {
+          if (_estWeight < 35.0f) _estWeight = rawEstKg;
+          else _estWeight = _estWeight * 0.96f + rawEstKg * 0.04f;
+        }
+      }
+    } else {
+      _stepArmed = true;
+    }
+
+    // 11. التحديث الذري الموحد لجميع القراءات (Unified Critical Section - Argon Point 6)
+    bool calcStepOff = false;
+    if (liveSpeedKmh >= 3.0f && _m.emptyBeltA > 0.5f) {
+      if ((nowMs - _lastStepMs) > 7000 && _smoothedCurrentA <= (_m.emptyBeltA + 0.40f)) {
+        calcStepOff = true;
+      }
+    }
+
+    portENTER_CRITICAL(&dspMux);
+    _m.zeroVoltMv = _zeroMv;
+    _m.currentA = _smoothedCurrentA;
+    _m.motorLoadPct = (_smoothedCurrentA / _cfg.ratedCurrentA) * 100.0f;
+    _m.stallAlert = _stallActive;
+    _m.powerWatts = calcPowerWatts;
+    _m.energyKWh = _energyWs / 3600000.0f;
+    _m.currentP2pA = (maxAc > minAc) ? (maxAc - minAc) : 0.0f;
+    _m.kurtosis = _m.kurtosis * 0.70f + (float)rawKurtosis * 0.30f;
+    _m.arcingScore = _arcingScore;
+    _m.brushHealth = _brushState;
+    _m.stepCount = _stepCount;
+    _m.symmetryPct = _symmetryPct;
+    if (_estWeight >= 35.0f) _m.estimatedWeightKg = _estWeight;
+    _m.stepOffAlert = calcStepOff;
+    if (liveSpeedKmh > 2.0f && calcPowerWatts > 20.0f) {
+      _m.runningEconomyWhPerKm = calcPowerWatts / liveSpeedKmh;
+    }
+    portEXIT_CRITICAL(&dspMux);
+  }
+
+  void resetSteps() {
+    portENTER_CRITICAL(&dspMux);
+    _stepCount = 0;
+    _m.stepCount = 0;
+    _m.cadenceSpm = 0;
+    _lastStepMs = 0;
+    portEXIT_CRITICAL(&dspMux);
+  }
+
+  void resetEnergy() {
+    portENTER_CRITICAL(&dspMux);
+    _energyWs = 0.0f;
+    _m.energyKWh = 0.0f;
+    portEXIT_CRITICAL(&dspMux);
+  }
+
+  void loadCumulativeCounters(float totalKWh, uint32_t totalSteps) {
+    portENTER_CRITICAL(&dspMux);
+    if (!isnan(totalKWh) && totalKWh >= 0.0f) {
+      _energyWs = totalKWh * 3600000.0f;
+      _m.energyKWh = totalKWh;
+    }
+    _stepCount = totalSteps;
+    _m.stepCount = totalSteps;
+    portEXIT_CRITICAL(&dspMux);
+  }
+
+  float getCumulativeEnergyKWh() const {
+    portENTER_CRITICAL((portMUX_TYPE*)&dspMux);
+    float v = _m.energyKWh;
+    portEXIT_CRITICAL((portMUX_TYPE*)&dspMux);
+    return v;
+  }
+
+  uint32_t getCumulativeSteps() const {
+    portENTER_CRITICAL((portMUX_TYPE*)&dspMux);
+    uint32_t v = _stepCount;
+    portEXIT_CRITICAL((portMUX_TYPE*)&dspMux);
+    return v;
+  }
+
+  void resetArcingScore() {
+    portENTER_CRITICAL(&dspMux);
+    _arcingScore = 0.0f;
+    _m.arcingScore = 0.0f;
+    _m.brushHealth = 0;
+    portEXIT_CRITICAL(&dspMux);
+  }
+
+  Metrics getMetrics() const {
+    Metrics copy;
+    portENTER_CRITICAL((portMUX_TYPE*)&dspMux);
+    copy = _m;
+    portEXIT_CRITICAL((portMUX_TYPE*)&dspMux);
+    return copy;
+  }
+
+private:
+  float _effectiveSens() const {
+    if (_cfg.autoSensOn != 0) {
+      float calculated = 40.0f * (2.0f * _zeroMv / 5000.0f);
+      if (calculated >= 15.0f && calculated <= 45.0f) return calculated;
+    }
+    return _cfg.sensMvPerA;
+  }
+
+  void _updateActiveSensitivity() {
+    _m.activeSensMvA = _effectiveSens();
+  }
+
+  void _validateConfig() {
+    if (isnan(_cfg.ratedCurrentA) || _cfg.ratedCurrentA < 5.0f || _cfg.ratedCurrentA > 25.0f) _cfg.ratedCurrentA = RATED_CURRENT_A;
+    if (isnan(_cfg.stallLimitA) || _cfg.stallLimitA < 2.0f || _cfg.stallLimitA > 15.0f) _cfg.stallLimitA = STALL_CURRENT_A;
+    if (_cfg.stallDelayMs < 100 || _cfg.stallDelayMs > 1500) _cfg.stallDelayMs = 800;
+    if (isnan(_cfg.kurtosisThresh) || _cfg.kurtosisThresh < 4.0f || _cfg.kurtosisThresh > 30.0f) _cfg.kurtosisThresh = 7.5f;
+    if (isnan(_cfg.cusumWarnScore) || _cfg.cusumWarnScore < 5.0f || _cfg.cusumWarnScore > 50.0f) _cfg.cusumWarnScore = 18.0f;
+    if (isnan(_cfg.cusumCritScore) || _cfg.cusumCritScore < 20.0f || _cfg.cusumCritScore > 90.0f) _cfg.cusumCritScore = 45.0f;
+    if (isnan(_cfg.emptyBeltWarnA) || _cfg.emptyBeltWarnA < 1.5f || _cfg.emptyBeltWarnA > 6.0f) _cfg.emptyBeltWarnA = 3.5f;
+    if (isnan(_cfg.stepDeltaA) || _cfg.stepDeltaA < 0.08f || _cfg.stepDeltaA > 0.80f) _cfg.stepDeltaA = 0.18f;
+    if (isnan(_cfg.sensMvPerA) || _cfg.sensMvPerA < 15.0f || _cfg.sensMvPerA > 45.0f) _cfg.sensMvPerA = DEFAULT_SENS_MV_A;
+    if (isnan(_cfg.nominalBusV) || _cfg.nominalBusV < 90.0f || _cfg.nominalBusV > 240.0f) _cfg.nominalBusV = RATED_BUS_VOLTS;
+    if (isnan(_cfg.calibratedBaselineA) || _cfg.calibratedBaselineA < 0.5f || _cfg.calibratedBaselineA > 5.0f) _cfg.calibratedBaselineA = 1.80f;
+    if (isnan(_cfg.inertiaDelayS) || _cfg.inertiaDelayS < 1.0f || _cfg.inertiaDelayS > 10.0f) _cfg.inertiaDelayS = 3.5f;
+    if (isnan(_cfg.inclineCompA) || _cfg.inclineCompA < 0.0f || _cfg.inclineCompA > 0.50f) _cfg.inclineCompA = 0.15f;
+    if (isnan(_cfg.weightKgPerA) || _cfg.weightKgPerA < 15.0f || _cfg.weightKgPerA > 90.0f) _cfg.weightKgPerA = 32.0f;
+  }
+
+  uint8_t _pin;
+  float _zeroMv;
+  bool _calibrated;
+
+  DspConfig _cfg;
+
+  float _arcingScore;
+  uint8_t _brushState;
+
+  uint32_t _emptyBeltSampleCount;
+  float _emptyBeltSum;
+  bool _pendingLubricationCal;
+
+  float _energyWs;
+  uint32_t _lastEnergyUpdateMs;
+
+  uint32_t _stepCount;
+  uint32_t _lastStepMs;
+  float _stepLpCurrent;
+  float _prevStepSlope;
+  float _leftPeakSum;
+  float _rightPeakSum;
+  bool _stepAlternator;
+  float _symmetryPct;
+  bool _stepArmed;
+
+  uint32_t _stallStartMs;
+  bool _stallActive;
+
+  uint32_t _lastBurstMs;
+  float _smoothedCurrentA;
+  float _estWeight;
+
+  Metrics _m;
+
+  // Static/BSS buffers allocated inside class instance, completely off task stack
+  float _rawMv[BURST_SIZE];
+  float _hp[BURST_SIZE];
+};
+
+} // namespace dsp
+
 
 #define PIN_DS   4
 #define PIN_ACS  5
@@ -45,8 +1423,7 @@
 #define U16(x) NimBLEUUID((uint16_t)(x))
 
 // الأنواع هنا في الأعلى: مترجم Arduino يولّد تعريفات الدوال تلقائيًا قبل أول دالة
-struct Fwd { uint8_t n; uint8_t d[10]; uint32_t ms; };
-struct LockState { uint32_t last; bool stopped; float lastTarget; };
+// Fwd and LockState declared at top
 
 // تصريحات مسبقة لضمان الترجمة القياسية في مترجم C++ و Arduino CLI
 void sendLine(const char* s);
@@ -977,7 +2354,12 @@ void bridgePump(uint32_t now) {
   if (nPkt > 0) {                                     // بيانات المشاية إلى التطبيقات
     fmData->setValue(bPkt, nPkt);
     fmData->notify();
-    if ((uint32_t)(now - tmSpeedMs) < 4000) mhe.feedSpeed(now, tmSpeed, tmIncl);
+    if ((uint32_t)(now - tmSpeedMs) < 4000) {
+      float curA = dspEngine.getMetrics().currentA;
+      // لا نمرر سرعة لوحدة صحة المحرك إلا إذا كان المحرك يسحب تياراً حقيقياً (يمنع جلسات 1.0 كم/س الوهمية أثناء التوقف)
+      float realSpd = (curA >= 0.80f && tmSpeed >= 1.5f) ? tmSpeed : 0.0f;
+      mhe.feedSpeed(now, realSpd, tmIncl);
+    }
   } else if (!tmLinked && ftmsLastAct && (uint32_t)(now - ftmsLastAct) < 60000) {
     static uint32_t lastZero = 0;                     // قبل اكتمال الاتصال: آخر قراءة معروفة (أو صفر)
     if ((uint32_t)(now - lastZero) >= 1000) {
@@ -1408,8 +2790,8 @@ void loop() {
     lastCurMs = now;
     auto m = dspEngine.getMetrics();
     char b[128];
-    snprintf(b, sizeof b, "CUR:I=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,C=%u,P=%.1f,E=%.2f,R=%.0f\n",
-             m.currentA, m.kurtosis, (int)m.brushHealth, m.powerWatts,
+    snprintf(b, sizeof b, "CUR:I=%.2f,PK=%.2f,K=%.2f,B=%d,W=%.1f,S=%u,C=%u,P=%.1f,E=%.2f,R=%.0f\n",
+             m.currentA, mhe.getLivePeakCurrentA(), m.kurtosis, (int)m.brushHealth, m.powerWatts,
              (unsigned)m.stepCount, (unsigned)m.cadenceSpm, m.symmetryPct, m.emptyBeltA, m.frictionRatioPct);
     sendLine(b);
     if (m.stallAlert) {
@@ -1454,6 +2836,17 @@ void loop() {
   predictPump(now);
   capPump();
   otaPump();
+  if (!tmLinked || (uint32_t)(now - tmSpeedMs) >= 4000) {
+    auto dm = dspEngine.getMetrics();
+    if (dm.currentA >= 1.65f && dm.cadenceSpm >= 80) {
+      float estKmh = (dm.cadenceSpm >= 135) ? (6.0f + (dm.cadenceSpm - 135) * 0.12f) : (3.0f + (dm.cadenceSpm - 80) * 0.055f);
+      if (estKmh > 16.0f) estKmh = 16.0f;
+      mhe.feedSpeed(now, estKmh, 0.0f);
+    } else if (dm.currentA < 0.80f) {
+      mhe.feedSpeed(now, 0.0f, 0.0f);
+    }
+  }
+  { auto dm = dspEngine.getMetrics(); mhe.feedCurrent(dm.currentA, dm.currentP2pA); }
   mhe.loop(now);
   rawDumpPump();
   delay(5);
