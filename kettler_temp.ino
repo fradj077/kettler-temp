@@ -1659,7 +1659,7 @@ void sendLong(const char* s);
 
 void loadSafetyConfig() {
   safetyPrefs.begin("k_safety", false);
-  if (safetyPrefs.isKey("cfg")) {
+  if (safetyPrefs.getBytesLength("cfg") == sizeof(safetyCfg)) {
     safetyPrefs.getBytes("cfg", &safetyCfg, sizeof(safetyCfg));
   } else {
     safetyPrefs.putBytes("cfg", &safetyCfg, sizeof(safetyCfg));
@@ -1762,9 +1762,10 @@ void checkSafetyTriggers(uint32_t nowMs, float speedKmh) {
   }
 
   // 2. كاشف الانزلاق والصدمة الشاذة المستمرة (Sustained Drag)
+  // تيار المشي الطبيعي يصل إلى 4.5A-5.0A، لذا يجب أن يكون حد الصدمة الشاذة أعلى من تيار المشي العادي
   if (safetyCfg.drEn && speedKmh >= 2.5f) {
-    float expectedRunA = ((m.emptyBeltA > 0.5f) ? m.emptyBeltA : 1.20f) + safetyCfg.drAmp;
-    if (m.currentA >= expectedRunA) {
+    float dragThresholdA = ((m.emptyBeltA > 0.5f) ? m.emptyBeltA : 1.34f) + 3.0f + safetyCfg.drAmp;
+    if (m.currentA >= dragThresholdA && m.currentA >= 6.5f) {
       if (dragStartMs == 0) dragStartMs = nowMs;
       else if ((nowMs - dragStartMs) >= safetyCfg.drMs) {
         uint32_t dragDur = nowMs - dragStartMs;
@@ -2053,7 +2054,10 @@ class TxCb : public NimBLECharacteristicCallbacks {
 };
 extern volatile uint32_t ftmsLastAct;
 class SrvCb : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s) { if (s->getConnectedCount() < 2) NimBLEDevice::startAdvertising(); }
+  void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
+    s->updateConnParams(desc->conn_handle, 24, 48, 0, 400);
+    if (s->getConnectedCount() < 2) NimBLEDevice::startAdvertising();
+  }
   void onDisconnect(NimBLEServer* s) {
     if (txChar) connected = (txChar->getSubscribedCount() > 0);
     if (!connected) manualLink = false;
