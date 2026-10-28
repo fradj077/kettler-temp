@@ -1511,6 +1511,8 @@ dsp::MotorCurrentDSP dspEngine;
 // Live speed from treadmill bridge (forward-declared for dspTask)
 volatile float tmSpeed = 0, tmIncl = 0;
 volatile uint32_t tmSpeedMs = 0;
+volatile uint8_t tmHeartRate = 0;
+volatile uint32_t tmHeartRateMs = 0;
 
 
 // ---------- تشخيص أسباب التوقف وحالة الأمان المتقدمة ----------
@@ -1692,11 +1694,14 @@ void onSafetyTrigger(uint8_t type, uint32_t valMs, float speed) {
     return;
   }
 
-  if (type == 1) { // كشف النزول أو السقوط المفاجئ
+  if (type == 1) { // كشف النزول أو السقوط المفاجئ -> إيقاف مؤقت ذكي يحفظ البرنامج والعدادات
     setStopReason(STOP_FALL_DISMOUNT, "FALL_DISMOUNT");
     latchedFaults |= FAULT_STALL_LATCH;
     updateFaultFlags();
-    if (tmCp) { uint8_t stopCmd[2] = {0x08, 0x01}; tmCp->writeValue(stopCmd, 2, false); }
+    if (tmCp) {
+      uint8_t pauseCmd[2] = {0x08, 0x02}; // 0x02 = Pause بدلاً من 0x01 = Reset Stop
+      tmCp->writeValue(pauseCmd, 2, false);
+    }
     char b[96];
     snprintf(b, sizeof(b), "SF:EVT=DISMOUNT,%lu,ACT\n", (unsigned long)valMs);
     sendLine(b);
@@ -2286,7 +2291,17 @@ void tmDataNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   if (!(f & 1)) { if (n >= o + 2) { tmSpeed = (d[o] | (d[o + 1] << 8)) * 0.01f; tmSpeedMs = millis(); } o += 2; }
   if (f & 2) o += 2;
   if (f & 4) o += 3;
-  if (f & 8) { if (n >= o + 2) tmIncl = (int16_t)(d[o] | (d[o + 1] << 8)) * 0.1f; }
+  if (f & 8) { if (n >= o + 2) tmIncl = (int16_t)(d[o] | (d[o + 1] << 8)) * 0.1f; o += 4; }
+  if (f & 0x010) o += 4; // elevation gain
+  if (f & 0x020) o += 1; // inst pace
+  if (f & 0x040) o += 1; // avg pace
+  if (f & 0x080) o += 5; // energy
+  if (f & 0x100) {       // heart rate present
+    if (n >= o + 1) {
+      tmHeartRate = d[o];
+      tmHeartRateMs = millis();
+    }
+  }
 }
 void tmStatusNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   if (n < 1 || n > sizeof tmSt) return;
