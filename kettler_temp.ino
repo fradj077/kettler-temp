@@ -2371,12 +2371,19 @@ extern volatile bool tmLinked;       // إعلان مسبق للارتباط ب�
 // نتيجة أمر التحكم: 1 نجاح، 2 غير مدعوم، 5 غير مسموح (الحماية فعّالة)
 uint8_t cpDecide(uint8_t op, bool lock, bool* fwd) {
   *fwd = false;
-  if (op == 0x00 || op == 0x01) return 1; // قبول طلب التحكم المبدئي من Kinomap ريثما يكتمل ربط الوسيط بالمشاية
+  if (op == 0x00 || op == 0x01) {
+    if (tmLinked) {
+      needCtrl = true;
+      *fwd = true;
+    }
+    return 1;
+  }
   if (!tmLinked) {
     return 5; // التحكّم غير مسموح لأن المشاية الحقيقية غير متصلة بالوسيط بعد
   }
+  bool thermalLock = (latchedFaults & (FAULT_TEMP_HOT | FAULT_TEMP_CRIT)) != 0;
   switch (op) {
-    case 0x02: case 0x03: case 0x07: if (lock) return 5; *fwd = true; return 1;
+    case 0x02: case 0x03: case 0x07: if (thermalLock) return 5; *fwd = true; return 1;
     case 0x08: *fwd = true; return 1;
     default: return 2;
   }
@@ -2470,12 +2477,21 @@ void tmStatusNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   portEXIT_CRITICAL(&pktMux);
 }
 void cpNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
-  if (n >= 3 && d[0] == 0x80 && d[2] == 0x05) {
-    needCtrl = true;   // 5 = لا صلاحية تحكم — إعادة طلب التحكم وإعادة إرسال السرعة تلقائياً
-    if (reqSpeed >= 0.5f) {
-      uint16_t rv = (uint16_t)lroundf(reqSpeed * 100.0f);
-      uint8_t b[3] = {0x02, (uint8_t)(rv & 255), (uint8_t)(rv >> 8)};
-      fwdPush(b, 3);
+  if (n >= 3 && d[0] == 0x80) {
+    if (connected) {
+      char msg[32];
+      snprintf(msg, sizeof(msg), "CP:OP=%u,RES=%u\n", (unsigned)d[1], (unsigned)d[2]);
+      sendLine(msg);
+    }
+    if (d[2] != 0x01) {
+      needCtrl = true;
+      if (d[1] == 0x02 && reqSpeed >= 0.5f) {
+        uint8_t stCmd[1] = {0x07};
+        fwdPush(stCmd, 1);
+        uint16_t rv = (uint16_t)lroundf(reqSpeed * 100.0f);
+        uint8_t b[3] = {0x02, (uint8_t)(rv & 255), (uint8_t)(rv >> 8)};
+        fwdPush(b, 3);
+      }
     }
   }
 }
@@ -2547,12 +2563,11 @@ bool tmConnect() {
 
 uint32_t lastCtrlReqMs = 0;
 void ensureCtrl() {
-  uint32_t now = millis();
-  if (tmCp && (needCtrl || (uint32_t)(now - lastCtrlReqMs) > 2500)) {
+  if (needCtrl && tmCp) {
     tmCp->writeValue(CMD_REQ, 1, false);
     needCtrl = false;
-    lastCtrlReqMs = now;
-    vTaskDelay(pdMS_TO_TICKS(120));
+    lastCtrlReqMs = millis();
+    vTaskDelay(pdMS_TO_TICKS(300));
   }
 }
 
@@ -2606,7 +2621,12 @@ void shaperReset() { reqSpeed = -1.0f; outSpeed = -1.0f; lastSentSpd = -1.0f; cd
 
 void handleFwd(const Fwd& f) {
   uint8_t op = f.d[0];
-  if (op == 0x02 && f.n >= 3) {                       // سرعة مستهدفة: تنفيذ فوري ومضمون
+  if (op == 0x00) {
+    needCtrl = true;
+    ensureCtrl();
+    return;
+  }
+  if (op == 0x02 && f.n >= 3) {                       // سرعة مستهدفة: تنفيذ فوري + تأكيد عبر shaperTick
     if (latchedFaults & FAULT_STALL_LATCH) {
       latchedFaults &= ~FAULT_STALL_LATCH;
       updateFaultFlags();
@@ -2618,7 +2638,7 @@ void handleFwd(const Fwd& f) {
     if (v < mn && v > 0.05f) v = mn;
     reqSpeed = v;
     outSpeed = v;
-    lastSentSpd = v;
+    lastSentSpd = -1.0f; // يجبر shaperTick على تأكيد إرسال السرعة مجدداً بعد 500ms
     uint16_t rawV = (uint16_t)lroundf(v * 100.0f);
     uint8_t cmdB[3] = {0x02, (uint8_t)(rawV & 255), (uint8_t)(rawV >> 8)};
     sendRaw(cmdB, 3);
