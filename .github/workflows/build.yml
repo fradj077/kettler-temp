@@ -1,6 +1,15 @@
 name: Build N16R8
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "**.ino"
+      - "**.h"
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,7 +28,8 @@ jobs:
       - name: Compile
         run: |
           mkdir -p sketch/kettler_temp
-          F=$(git log -1 --name-only --diff-filter=AM --format= -- '*.ino' | head -1)
+          F=$(git log --name-only --diff-filter=AM --format= -- "*.ino" | head -1)
+          if [ -z "$F" ] || [ ! -f "$F" ]; then F="kettler_temp.ino"; fi
           echo "Using sketch: $F"
           cp "$F" sketch/kettler_temp/kettler_temp.ino
           cp MotorHealth.h sketch/kettler_temp/ 2>/dev/null || true
@@ -34,6 +44,15 @@ jobs:
           echo "boot_app0: $BOOT_APP0"
           python -m esptool --chip esp32s3 merge_bin -o merged/kettler_temp_full.bin --flash_mode keep --flash_size 16MB 0x0 out/kettler_temp.ino.bootloader.bin 0x8000 out/kettler_temp.ino.partitions.bin 0xe000 "$BOOT_APP0" 0x10000 out/kettler_temp.ino.bin
           cp out/kettler_temp.ino.bin merged/kettler_temp_app.bin
+          cp out/kettler_temp.ino.bin ./kettler_temp_app.bin
+      - name: Publish binary to repository for Direct OTA
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
+          cp out/kettler_temp.ino.bin ./kettler_temp_app.bin
+          git add kettler_temp_app.bin
+          git diff --staged --quiet || (git commit -m "chore: update compiled kettler_temp_app.bin [skip ci]" && git push origin HEAD:main)
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
