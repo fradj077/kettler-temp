@@ -17,6 +17,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Pull latest kettler_temp.ino from Google Drive (Auto-Sync)
+        run: |
+          pip install -q gdown
+          mkdir -p gdrive_sync
+          if gdown --folder "https://drive.google.com/drive/folders/1dStuBSKGbNHVmeOpNWnXSsv0J62vJy_C" -O gdrive_sync --remaining-ok 2>/dev/null; then
+            LATEST_INO=$(find gdrive_sync -type f -name "kettler_temp.ino" | head -1)
+            if [ -n "$LATEST_INO" ] && [ -s "$LATEST_INO" ]; then
+              echo "Successfully pulled latest kettler_temp.ino from Google Drive!"
+              cp "$LATEST_INO" ./kettler_temp.ino
+            fi
+          else
+            echo "Google Drive folder not public yet, using repository kettler_temp.ino"
+          fi
       - uses: arduino/setup-arduino-cli@v2
       - name: Install core and libraries
         run: |
@@ -28,8 +41,11 @@ jobs:
       - name: Compile
         run: |
           mkdir -p sketch/kettler_temp
-          F=$(git log --name-only --diff-filter=AM --format= -- "*.ino" | head -1)
-          if [ -z "$F" ] || [ ! -f "$F" ]; then F="kettler_temp.ino"; fi
+          if [ -f "kettler_temp.ino" ]; then
+            F="kettler_temp.ino"
+          else
+            F=$(git log --name-only --diff-filter=AM --format= -- "*.ino" | head -1)
+          fi
           echo "Using sketch: $F"
           cp "$F" sketch/kettler_temp/kettler_temp.ino
           cp MotorHealth.h sketch/kettler_temp/ 2>/dev/null || true
@@ -39,20 +55,20 @@ jobs:
       - name: Collect firmware
         run: |
           mkdir -p merged
-          pip install esptool
+          pip install -q esptool
           BOOT_APP0=$(find ~/.arduino15 -name boot_app0.bin | head -1)
           echo "boot_app0: $BOOT_APP0"
           python -m esptool --chip esp32s3 merge_bin -o merged/kettler_temp_full.bin --flash_mode keep --flash_size 16MB 0x0 out/kettler_temp.ino.bootloader.bin 0x8000 out/kettler_temp.ino.partitions.bin 0xe000 "$BOOT_APP0" 0x10000 out/kettler_temp.ino.bin
           cp out/kettler_temp.ino.bin merged/kettler_temp_app.bin
           cp out/kettler_temp.ino.bin ./kettler_temp_app.bin
-      - name: Publish binary to repository for Direct OTA
+      - name: Publish binary and synced sketch to repository for Direct OTA
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git pull --rebase origin main || true
           cp out/kettler_temp.ino.bin ./kettler_temp_app.bin
-          git add kettler_temp_app.bin
-          git diff --staged --quiet || (git commit -m "chore: update compiled kettler_temp_app.bin [skip ci]" && git push origin HEAD:main)
+          git add kettler_temp.ino kettler_temp_app.bin
+          git diff --staged --quiet || (git commit -m "chore: auto-sync and build kettler_temp_app.bin [skip ci]" && git push origin HEAD:main)
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
