@@ -1668,10 +1668,11 @@ void loadSafetyConfig() {
     safetyPrefs.putBytes("cfg_v4", &safetyCfg, sizeof(safetyCfg));
   }
   safetyCfg.safeTest = 0;
-  if (safetyCfg.fsMs < 650) safetyCfg.fsMs = 750;
-  if (safetyCfg.drMs < 350) safetyCfg.drMs = 400;
-  if (safetyCfg.drAmp < 1.8f) safetyCfg.drAmp = 2.0f;
-  if (safetyCfg.rcVar < 35) safetyCfg.rcVar = 40;
+  // احترام القيم التي يحفظها المستخدم في الفلاش بالكامل (من 0.6A فصاعداً) دون إجبارها على 1.8A!
+  if (safetyCfg.fsMs < 250) safetyCfg.fsMs = 600;
+  if (safetyCfg.drMs < 100) safetyCfg.drMs = 250;
+  if (safetyCfg.drAmp < 0.6f) safetyCfg.drAmp = 1.2f;
+  if (safetyCfg.rcVar < 15) safetyCfg.rcVar = 35;
 }
 
 void saveSafetyConfig() {
@@ -1857,7 +1858,8 @@ void checkSafetyTriggers(uint32_t nowMs, float speedKmh) {
   float minWalkCandidateA = (dynEmptyBaseA > 0.5f) ? (dynEmptyBaseA + 0.70f) : 2.45f;
   if (m.currentA >= minWalkCandidateA && m.currentA <= 6.8f) {
     if (dynWalkAvgA < 1.0f) dynWalkAvgA = m.currentA;
-    else if (m.currentA < (dynWalkAvgA + 2.0f)) dynWalkAvgA = dynWalkAvgA * 0.92f + m.currentA * 0.08f;
+    else if ((nowMs - runnerLoadStartMs) < 1400 && m.currentA < 3.8f) dynWalkAvgA = dynWalkAvgA * 0.60f + m.currentA * 0.40f;
+    else if (m.currentA < (dynWalkAvgA + safetyCfg.drAmp * 0.85f)) dynWalkAvgA = dynWalkAvgA * 0.92f + m.currentA * 0.08f;
 
     if (dynFloorAvgA < 0.8f) dynFloorAvgA = instantFloorA;
     else if (instantFloorA < (dynFloorAvgA + 1.2f)) dynFloorAvgA = dynFloorAvgA * 0.94f + instantFloorA * 0.06f;
@@ -1869,14 +1871,16 @@ void checkSafetyTriggers(uint32_t nowMs, float speedKmh) {
     }
   }
 
-  // --- آلية 2 (ذكية وتعمل فوراً بدون اشتراط وقت ركوب أو عدد خطوات!): كاشف الانحشار والاحتكاك المستمر (Sustained Drag) ---
-  // يقيس قاع الموجة المستمر (valleyFloorA) بدلاً من قمة الخطوة العابرة، فيميز آلياً بين نبضة صعود القدم وبين الانحشار الحقيقي!
+  // --- آلية 2: كاشف الانزلاق والفرملة بالرجل (Sustained Drag) ---
+  // يحترم قيمة drAmp و drMs التي حفظها المستخدم بالضبط (مثلاً +1.0A)، ويميز بين استقرار وزن الصعود الطبيعي وبين الفرملة بالرجل!
   if (safetyCfg.drEn && speedKmh >= 1.5f) {
-    float baseFloorRef = (dynFloorAvgA > 0.9f) ? dynFloorAvgA : ((dynEmptyBaseA > 0.5f ? dynEmptyBaseA : 1.50f) + 0.65f);
-    float dragMargin = (safetyCfg.drAmp < 1.6f) ? 1.6f : safetyCfg.drAmp;
-    float dragFloorThresholdA = fmaxf(3.8f, baseFloorRef + dragMargin);
-    uint32_t reqDragMs = (safetyCfg.drMs < 300) ? 300 : safetyCfg.drMs;
-    if (valleyFloorA >= dragFloorThresholdA) {
+    bool settled = runnerLoadedOnBelt && ((nowMs - runnerLoadStartMs) >= 1400);
+    float baseRef = (settled && dynWalkAvgA > 1.8f)
+                      ? dynWalkAvgA
+                      : fmaxf(dynWalkAvgA, (dynEmptyBaseA > 0.5f ? dynEmptyBaseA : 1.45f) + 1.15f);
+    float dragThresholdA = baseRef + safetyCfg.drAmp;
+    uint32_t reqDragMs = (safetyCfg.drMs < 100) ? 100 : safetyCfg.drMs;
+    if (m.currentA >= dragThresholdA) {
       if (dragStartMs == 0) dragStartMs = nowMs;
       else if ((nowMs - dragStartMs) >= reqDragMs) {
         uint32_t dragDur = nowMs - dragStartMs;
@@ -2236,7 +2240,8 @@ class TxCb : public NimBLECharacteristicCallbacks {
 extern volatile uint32_t ftmsLastAct;
 class SrvCb : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
-    s->updateConnParams(desc->conn_handle, 24, 48, 0, 400);
+    (void)desc;
+    // عدم استدعاء updateConnParams لحظة الاتصال لتفادي خطأ GATT 133 (Connection attempt failed) أثناء استكشاف الخدمات في أندرويد
     if (s->getConnectedCount() < 2) NimBLEDevice::startAdvertising();
   }
   void onDisconnect(NimBLEServer* s) {
