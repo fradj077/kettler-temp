@@ -2596,21 +2596,40 @@ static void btnOnTargetSpeed(float v) {
 #endif
 }
 
-// الطريقة الاحتياطية: مراقبة السرعة الفعلية في حزم البيانات (تعمل فقط إن لم ترسل الكونسول رسالة 0x05 إطلاقاً)
+// الطريقة الاحتياطية: مراقبة السرعة في حزم البيانات (تعمل فقط إن لم ترسل الكونسول رسالة 0x05 إطلاقاً).
+// تعتمد على "الهدف المعتمد" btnG أيضاً، فالضغطة التي تلي ضغطة سابقة مباشرة تُكتشف حين تغادر السرعة الهدف بخطوة 0.1،
+// أو حين تستقر السرعة (حزمتان متطابقتان) على قيمة تبعد 0.1 عن الهدف المعتمد.
 void btnOnSpeedSample(float s) {
 #if BTN_BOOST_ENABLE
   static float last = -1.0f; static uint8_t stable = 0;
   uint32_t now = millis();
   bool statusMode = btnStatusMs && (uint32_t)(now - btnStatusMs) < 60000;
-  if (statusMode || btnG > 0) { last = s; stable = 0; return; }                    // الطريقة الأدق متاحة، أو هذه سرعة أمرنا
+  if (statusMode) { last = s; stable = 0; return; }                                 // الطريقة الأدق متاحة
   if (last >= 0) {
     float dl = s - last, ad = fabsf(dl);
-    if (ad < 0.03f) { if (stable < 250) stable++; }
-    else {
-      bool ownRecent = ownLastMs && (uint32_t)(now - ownLastMs) < 8000;
-      if (stable >= 2 && !ownRecent && ad >= BTN_STEP_MIN && ad <= BTN_STEP_MAX)
-        btnPress(dl > 0 ? 1.0f : -1.0f, (int)lroundf(ad / 0.1f), last, now);
-      stable = 0;
+    if (ad < 0.03f) {                                                               // لم تتغير: استقرار
+      if (stable < 250) stable++;
+      if (btnG > 0 && stable >= 2) {                                                // مستقرة على قيمة تبعد 0.1 عن الهدف المعتمد
+        float dg = s - btnG, ag = fabsf(dg);
+        if (ag >= BTN_STEP_MIN && ag <= BTN_STEP_MAX) { btnPress(dg > 0 ? 1.0f : -1.0f, (int)lroundf(ag / 0.1f), s, now); stable = 0; }
+      }
+    } else {
+      uint8_t wasStable = stable; stable = 0;
+      if (btnG > 0) {                                                               // هدف معتمد قيد التنفيذ
+        float dgNow = s - btnG, dgLast = last - btnG;
+        bool leftTarget = fabsf(dgLast) < 0.03f && fabsf(dgNow) >= BTN_STEP_MIN && fabsf(dgNow) <= BTN_STEP_ONE;
+        bool up = btnG > last + 0.03f, dn = btnG < last - 0.03f;                     // اتجاه الأمر الأخير
+        if (leftTarget) btnPress(dgNow > 0 ? 1.0f : -1.0f, 1, s, now);               // ضغطة بعد أن وصلت السرعة إلى الهدف
+        else if (up && dgNow > 0.03f && dgNow <= BTN_STEP_MAX)                       // تجاوزت الهدف صعوداً: لا يحدث بالتسارع وحده
+          btnPress(1.0f, (int)lroundf(dgNow / 0.1f), s, now);
+        else if (dn && dgNow < -0.03f && -dgNow <= BTN_STEP_MAX)
+          btnPress(-1.0f, (int)lroundf(-dgNow / 0.1f), s, now);
+        // غير ذلك: تسارع المشاية نحو الهدف، تجاهله (يُفحَص عند الاستقرار)
+      } else {
+        bool ownRecent = ownLastMs && (uint32_t)(now - ownLastMs) < 3000;
+        if (wasStable >= 1 && !ownRecent && ad >= BTN_STEP_MIN && ad <= BTN_STEP_MAX)
+          btnPress(dl > 0 ? 1.0f : -1.0f, (int)lroundf(ad / 0.1f), last, now);
+      }
     }
   }
   last = s;
