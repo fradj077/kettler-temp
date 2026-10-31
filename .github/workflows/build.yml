@@ -21,7 +21,7 @@ jobs:
         run: |
           pip install -q gdown
           mkdir -p gdrive_sync
-          if gdown --folder "https://drive.google.com/drive/folders/1dStuBSKGbNHVmeOpNWnXSsv0J62vJy_C" -O gdrive_sync --remaining-ok 2>/dev/null; then
+          if gdown --folder "https://drive.google.com/drive/folders/1dStuBSKGbNHVmeOpNWnXSsv0J62vJy_C" -O gdrive_sync; then
             LATEST_INO=$(find gdrive_sync -type f -name "kettler_temp.ino" | head -1)
             if [ -n "$LATEST_INO" ] && [ -s "$LATEST_INO" ]; then
               echo "Successfully pulled latest kettler_temp.ino from Google Drive!"
