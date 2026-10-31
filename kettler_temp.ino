@@ -2486,6 +2486,7 @@ static portMUX_TYPE pktMux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t tmPkt[32]; volatile uint8_t tmPktLen = 0; volatile bool tmPktNew = false;
 uint8_t tmSt[16];  volatile uint8_t tmStLen = 0;  volatile bool tmStNew = false;
 
+void btnOnSpeedSample(float s);
 void tmDataNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   if (n < 2 || n > sizeof tmPkt) return;
   portENTER_CRITICAL(&pktMux);
@@ -2493,7 +2494,7 @@ void tmDataNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   portEXIT_CRITICAL(&pktMux);
   uint16_t f = d[0] | (d[1] << 8);
   size_t o = 2;
-  if (!(f & 1)) { if (n >= o + 2) { tmSpeed = (d[o] | (d[o + 1] << 8)) * 0.01f; tmSpeedMs = millis(); } o += 2; }
+  if (!(f & 1)) { if (n >= o + 2) { tmSpeed = (d[o] | (d[o + 1] << 8)) * 0.01f; tmSpeedMs = millis(); btnOnSpeedSample(tmSpeed); } o += 2; }
   if (f & 2) o += 2;
   if (f & 4) o += 3;
   if (f & 8) { if (n >= o + 2) tmIncl = (int16_t)(d[o] | (d[o + 1] << 8)) * 0.1f; o += 4; }
@@ -2510,10 +2511,10 @@ void tmDataNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
 }
 // ---------- مضاعفة خطوة أزرار مقبض المشاية: كل ضغطة (±0.1) تصبح ±0.5 كم/س ----------
 // الفكرة: كونسول Kettler يُبلغ عبر FTMS Status (الرمز 0x05 = السرعة المستهدفة تغيّرت). عند رصد تغيّر قدره ±0.1
-// لم تصدره اللوحة نفسها، تُرسل اللوحة فوراً سرعة مستهدفة جديدة = القيمة السابقة ± 0.5.
+// لم تصدره اللوحة نفسها، تُرسل اللوحة فوراً السرعة التالية على شبكة 0.5 (…3.0 ← 3.5 ← 4.0…) أو السابقة عند الخفض.
 // أوامر التطبيقات (الصفحة / Kinomap) تمر عبر sendRaw فتُسجَّل كأوامر ذاتية ويُتجاهل صداها، فلا تُضاعف.
 #define BTN_BOOST_ENABLE 1                    // 0 = تعطيل الميزة بالكامل
-static const float BTN_BOOST_EXTRA = 0.4f;    // الزيادة الإضافية لكل ضغطة (0.1 + 0.4 = 0.5)
+static const float BTN_MAX_KMH = 20.0f;       // أقصى سرعة (تُقيَّد أيضاً بحدود المشاية والتطبيق)
 static const float BTN_STEP_MIN = 0.06f;      // نطاق التغيّر المعتبر ضغطة زر (0.1 ± هامش)
 static const float BTN_STEP_MAX = 0.14f;
 static volatile float btnLastV = -1.0f;       // آخر سرعة مستهدفة أبلغت عنها المشاية
@@ -2530,6 +2531,45 @@ static bool isOwnEcho(float v, uint32_t now) {
     if (ownMs[i] && (uint32_t)(now - ownMs[i]) < 4000 && fabsf(ownSpd[i] - v) < 0.03f) return true;
   return false;
 }
+#if BTN_BOOST_ENABLE
+// يُنفَّذ عند اكتشاف ضغطة زر: prev = السرعة قبلها، dl = التغيّر (≈ ±0.1)
+static void btnFire(float prev, float dl, uint32_t now) {
+  float ad = fabsf(dl);
+  if (ad < BTN_STEP_MIN || ad > BTN_STEP_MAX) return;                               // ليست ضغطة زر
+  if (lockOn || latchedFaults != FAULT_NONE) return;                                // لا مضاعفة أثناء حماية الحرارة/الأعطال
+  if (!(tmSpeedMs && (uint32_t)(now - tmSpeedMs) < 5000 && tmSpeed >= 0.5f)) return; // السير متوقف
+  float sgn = dl > 0 ? 1.0f : -1.0f;
+  float base = (btnBoostTarget > 0) ? btnBoostTarget : prev;                        // ضغطات متتالية تتراكم
+  // الهدف = الدرجة التالية على شبكة 0.5 كم/س (…، 3.0، 3.5، 4.0، …): للأعلى أول مضاعف 0.5 أكبر من base، وللأسفل أول مضاعف أصغر
+  float t = (sgn > 0) ? (floorf(base * 2.0f + 0.001f) + 1.0f) * 0.5f : (ceilf(base * 2.0f - 0.001f) - 1.0f) * 0.5f;
+  if (t < 0.5f) t = 0.5f;
+  if (t > BTN_MAX_KMH) t = BTN_MAX_KMH;
+  btnBoostTarget = t; btnBoostMs = now;
+  uint16_t rv = (uint16_t)lroundf(t * 100.0f);
+  uint8_t b[3] = {0x02, (uint8_t)(rv & 255), (uint8_t)(rv >> 8)};
+  fwdPush(b, 3);                                                                    // يمر عبر handleFwd (حدود السرعة والحماية)
+  Serial.printf("[BTN-BOOST] %.2f -> %+.1f : sending %.1f km/h\n", prev, dl, t);
+}
+// الطريقة الاحتياطية: مراقبة السرعة الفعلية في حزم البيانات (إن لم ترسل الكونسول رسالة 0x05)
+void btnOnSpeedSample(float s) {
+  static float last = -1.0f; static uint8_t stable = 0;
+  uint32_t now = millis();
+  if (last >= 0) {
+    float dl = s - last;
+    if (fabsf(dl) < 0.03f) { if (stable < 250) stable++; }
+    else {
+      bool ownRecent = false;
+      for (uint8_t i = 0; i < 6; i++) if (ownMs[i] && (uint32_t)(now - ownMs[i]) < 8000) ownRecent = true;
+      bool boostRecent = btnBoostMs && (uint32_t)(now - btnBoostMs) < 8000;
+      if (stable >= 2 && !ownRecent && !boostRecent) btnFire(last, dl, now);
+      stable = 0;
+    }
+  }
+  last = s;
+}
+#else
+void btnOnSpeedSample(float) {}
+#endif
 static void btnOnTargetSpeed(float v) {
   uint32_t now = millis();
   bool echo = isOwnEcho(v, now);
@@ -2543,19 +2583,7 @@ static void btnOnTargetSpeed(float v) {
   if (btnBoostTarget > 0 && (uint32_t)(now - btnBoostMs) > 3000) btnBoostTarget = -1.0f;
   if (prev < 0 && tmSpeedMs && (uint32_t)(now - tmSpeedMs) < 4000) prev = tmSpeed;   // لا مرجع بعد: استخدم السرعة الحالية
   if (prev < 0) return;
-  float dl = v - prev, ad = fabsf(dl);
-  if (ad < BTN_STEP_MIN || ad > BTN_STEP_MAX) return;                               // ليست ضغطة زر
-  if (lockOn || latchedFaults != FAULT_NONE) return;                                // لا مضاعفة أثناء حماية الحرارة/الأعطال
-  if (!(tmSpeedMs && (uint32_t)(now - tmSpeedMs) < 5000 && tmSpeed >= 0.5f)) return; // السير متوقف
-  float sgn = dl > 0 ? 1.0f : -1.0f;
-  float base = (btnBoostTarget > 0) ? btnBoostTarget : prev;                        // ضغطات متتالية تتراكم
-  float t = roundf((base + sgn * (0.1f + BTN_BOOST_EXTRA)) * 10.0f) / 10.0f;
-  if (t < 1.0f) t = 1.0f;
-  btnBoostTarget = t; btnBoostMs = now;
-  uint16_t rv = (uint16_t)lroundf(t * 100.0f);
-  uint8_t b[3] = {0x02, (uint8_t)(rv & 255), (uint8_t)(rv >> 8)};
-  fwdPush(b, 3);                                                                    // يمر عبر handleFwd (حدود السرعة والحماية)
-  Serial.printf("[BTN-BOOST] console %.2f -> %.2f (%+.1f): sending %.1f km/h\n", prev, v, dl, t);
+  btnFire(prev, v - prev, now);
 #endif
 }
 
