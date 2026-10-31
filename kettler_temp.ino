@@ -2509,81 +2509,113 @@ void tmDataNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
     }
   }
 }
-// ---------- مضاعفة خطوة أزرار مقبض المشاية: كل ضغطة (±0.1) تصبح ±0.5 كم/س ----------
-// الفكرة: كونسول Kettler يُبلغ عبر FTMS Status (الرمز 0x05 = السرعة المستهدفة تغيّرت). عند رصد تغيّر قدره ±0.1
-// لم تصدره اللوحة نفسها، تُرسل اللوحة فوراً السرعة التالية على شبكة 0.5 (…3.0 ← 3.5 ← 4.0…) أو السابقة عند الخفض.
-// أوامر التطبيقات (الصفحة / Kinomap) تمر عبر sendRaw فتُسجَّل كأوامر ذاتية ويُتجاهل صداها، فلا تُضاعف.
+// ---------- خطوة أزرار مقبض المشاية: كل ضغطة تنتقل إلى الدرجة التالية على شبكة 0.5 كم/س ----------
+// كونسول Kettler يُبلغ عبر FTMS Status (الرمز 0x05 = السرعة المستهدفة تغيّرت) عند كل ضغطة (±0.1).
+// عند رصد ضغطة لم تصدرها اللوحة نفسها: تُحسب الدرجة التالية على الشبكة من "الهدف المعتمد" btnG (لا من القيمة التي
+// تعرضها المشاية)، فتتراكم الضغطات السريعة بدقة (3.0 ← 3.5 ← 4.0 ← 4.5 ...) ولا تتأثر بترتيب وصول الأوامر.
+// ثم تتحقق btnTick من أن المشاية استقرت فعلاً على الهدف المعتمد وتعيد إرساله إن لم تفعل (تصحيح 3.7 ونحوها).
+// أوامر التطبيقات (الصفحة / Kinomap) تمر عبر sendRaw فتُسجَّل كأوامر ذاتية ويُتجاهل صداها، فلا تُغيَّر.
 #define BTN_BOOST_ENABLE 1                    // 0 = تعطيل الميزة بالكامل
+static const float BTN_GRID = 0.5f;           // خطوة الشبكة كم/س
 static const float BTN_MAX_KMH = 20.0f;       // أقصى سرعة (تُقيَّد أيضاً بحدود المشاية والتطبيق)
-static const float BTN_STEP_MIN = 0.06f;      // نطاق التغيّر المعتبر ضغطة زر (0.1 ± هامش)
-static const float BTN_STEP_MAX = 0.14f;
-static volatile float btnLastV = -1.0f;       // آخر سرعة مستهدفة أبلغت عنها المشاية
-static volatile float btnBoostTarget = -1.0f; // هدف مضاعَف قيد الإرسال (لتعدد الضغطات السريعة)
-static volatile uint32_t btnBoostMs = 0;
-static float ownSpd[6]; static uint32_t ownMs[6]; static uint8_t ownIdx = 0;
+static const float BTN_STEP_MIN = 0.06f;      // أصغر تغيّر يُعتبر ضغطة زر (الضغطة = 0.1)
+static const float BTN_STEP_ONE = 0.14f;      // أكبر تغيّر يُعتبر ضغطة واحدة
+static const float BTN_STEP_MAX = 0.55f;      // أكبر تغيّر يُعتبر عدة ضغطات مدمجة (حتى 5)
+static volatile float btnLastV = -1.0f;       // آخر سرعة مستهدفة أبلغت عنها المشاية (أي رسالة 0x05)
+static volatile uint32_t btnStatusMs = 0;     // آخر مرة وصلت فيها رسالة 0x05
+static volatile float btnG = -1.0f;           // الهدف المعتمد على الشبكة (-1 = لا شيء قيد التنفيذ)
+static volatile uint32_t btnEventMs = 0;      // وقت آخر ضغطة
+static volatile uint32_t btnSentMs = 0;       // وقت آخر إرسال للهدف المعتمد
+static volatile uint8_t btnRetry = 0;
+// قائمة أوامر السرعة التي أرسلتها اللوحة وتنتظر صداها (FIFO): كل أمر يُتوقع له رسالة حالة واحدة بالقيمة نفسها
+static const uint8_t OWN_N = 8;
+static float ownSpd[OWN_N]; static uint32_t ownMs[OWN_N], ownSeq[OWN_N]; static bool ownPend[OWN_N]; static uint8_t ownIdx = 0;
+static uint32_t ownCtr = 0;
+static volatile uint32_t ownLastMs = 0;       // آخر أمر سرعة أرسلته اللوحة
 
 void noteOwnSpeed(float v) {                  // تُستدعى عند كل أمر سرعة ترسله اللوحة للمشاية
-  uint8_t i = ownIdx % 6; ownSpd[i] = v; ownMs[i] = millis(); ownIdx++;
-  btnLastV = v;
+  uint8_t i = ownIdx % OWN_N; ownSpd[i] = v; ownMs[i] = millis(); ownPend[i] = true; ownSeq[i] = ++ownCtr; ownIdx++;
+  ownLastMs = ownMs[i];
 }
+// هل هذه الرسالة صدى لأحد أوامرنا؟ يُطابَق الأقدم أولاً (ترتيب الرسائل محفوظ)، وتُستهلك الأوامر الأقدم منه أيضاً
 static bool isOwnEcho(float v, uint32_t now) {
-  for (uint8_t i = 0; i < 6; i++)
-    if (ownMs[i] && (uint32_t)(now - ownMs[i]) < 4000 && fabsf(ownSpd[i] - v) < 0.03f) return true;
-  return false;
+  int best = -1;
+  for (uint8_t k = 0; k < OWN_N; k++) {
+    if (!ownPend[k]) continue;
+    if ((uint32_t)(now - ownMs[k]) > 1500) { ownPend[k] = false; continue; }   // لم يصل صداها: انسَها
+    if (fabsf(ownSpd[k] - v) < 0.03f && (best < 0 || ownSeq[k] < ownSeq[best])) best = k;
+  }
+  if (best < 0) return false;
+  uint32_t bs = ownSeq[best];
+  for (uint8_t k = 0; k < OWN_N; k++) if (ownPend[k] && ownSeq[k] <= bs) ownPend[k] = false;
+  return true;
 }
 #if BTN_BOOST_ENABLE
-// يُنفَّذ عند اكتشاف ضغطة زر: prev = السرعة قبلها، dl = التغيّر (≈ ±0.1)
-static void btnFire(float prev, float dl, uint32_t now) {
-  float ad = fabsf(dl);
-  if (ad < BTN_STEP_MIN || ad > BTN_STEP_MAX) return;                               // ليست ضغطة زر
-  if (lockOn || latchedFaults != FAULT_NONE) return;                                // لا مضاعفة أثناء حماية الحرارة/الأعطال
+static float gridUp(float b) { return (floorf(b / BTN_GRID + 0.001f) + 1.0f) * BTN_GRID; }
+static float gridDn(float b) { return (ceilf(b / BTN_GRID - 0.001f) - 1.0f) * BTN_GRID; }
+
+// ضغطة (أو n ضغطات مدمجة) في اتجاه sgn؛ prevRef = آخر سرعة معروفة قبل الضغطة (تُستخدم فقط إن لم يكن هناك هدف معتمد)
+static void btnPress(float sgn, int n, float prevRef, uint32_t now) {
+  if (lockOn || latchedFaults != FAULT_NONE) return;                                // لا تدخل أثناء حماية الحرارة/الأعطال
   if (!(tmSpeedMs && (uint32_t)(now - tmSpeedMs) < 5000 && tmSpeed >= 0.5f)) return; // السير متوقف
-  float sgn = dl > 0 ? 1.0f : -1.0f;
-  float base = (btnBoostTarget > 0) ? btnBoostTarget : prev;                        // ضغطات متتالية تتراكم
-  // الهدف = الدرجة التالية على شبكة 0.5 كم/س (…، 3.0، 3.5، 4.0، …): للأعلى أول مضاعف 0.5 أكبر من base، وللأسفل أول مضاعف أصغر
-  float t = (sgn > 0) ? (floorf(base * 2.0f + 0.001f) + 1.0f) * 0.5f : (ceilf(base * 2.0f - 0.001f) - 1.0f) * 0.5f;
-  if (t < 0.5f) t = 0.5f;
+  if (n < 1) n = 1;
+  if (n > 5) n = 5;
+  float t = (btnG > 0) ? btnG : prevRef;
+  for (int i = 0; i < n; i++) t = (sgn > 0) ? gridUp(t) : gridDn(t);
+  if (t < BTN_GRID) t = BTN_GRID;
   if (t > BTN_MAX_KMH) t = BTN_MAX_KMH;
-  btnBoostTarget = t; btnBoostMs = now;
+  btnG = t; btnEventMs = now; btnSentMs = now; btnRetry = 0;
   uint16_t rv = (uint16_t)lroundf(t * 100.0f);
   uint8_t b[3] = {0x02, (uint8_t)(rv & 255), (uint8_t)(rv >> 8)};
   fwdPush(b, 3);                                                                    // يمر عبر handleFwd (حدود السرعة والحماية)
-  Serial.printf("[BTN-BOOST] %.2f -> %+.1f : sending %.1f km/h\n", prev, dl, t);
+  Serial.printf("[BTN] press %+d x%d : target -> %.1f km/h\n", sgn > 0 ? 1 : -1, n, t);
 }
-// الطريقة الاحتياطية: مراقبة السرعة الفعلية في حزم البيانات (إن لم ترسل الكونسول رسالة 0x05)
+#endif
+
+// رسالة حالة 0x05: v = السرعة المستهدفة الجديدة
+static void btnOnTargetSpeed(float v) {
+  uint32_t now = millis();
+  btnStatusMs = now;
+  float prev = btnLastV;
+  btnLastV = v;
+  if (isOwnEcho(v, now)) return;                                                    // صدى أمر أرسلناه نحن
+#if BTN_BOOST_ENABLE
+  if (prev < 0 && tmSpeedMs && (uint32_t)(now - tmSpeedMs) < 4000) prev = tmSpeed;  // لا مرجع بعد: استخدم السرعة الحالية
+  if (prev < 0) return;
+  float dp = v - prev, ap = fabsf(dp);
+  if (btnG > 0) {                                                                    // هدف معتمد قيد التنفيذ
+    float dg = v - btnG, ag = fabsf(dg);
+    bool okP = (ap >= BTN_STEP_MIN && ap <= BTN_STEP_ONE);                          // ضغطة سبقت وصول أمرنا للمشاية
+    bool okG = (ag >= BTN_STEP_MIN && ag <= BTN_STEP_ONE);                          // ضغطة بعد وصوله
+    if (okP && (!okG || ap <= ag)) btnPress(dp > 0 ? 1.0f : -1.0f, 1, prev, now);
+    else if (okG) btnPress(dg > 0 ? 1.0f : -1.0f, 1, prev, now);
+    else if (ap > BTN_STEP_ONE && ap <= BTN_STEP_MAX) btnPress(dp > 0 ? 1.0f : -1.0f, (int)lroundf(ap / 0.1f), prev, now);
+  } else if (ap >= BTN_STEP_MIN && ap <= BTN_STEP_MAX) {
+    btnPress(dp > 0 ? 1.0f : -1.0f, (int)lroundf(ap / 0.1f), prev, now);
+  }
+#endif
+}
+
+// الطريقة الاحتياطية: مراقبة السرعة الفعلية في حزم البيانات (تعمل فقط إن لم ترسل الكونسول رسالة 0x05 إطلاقاً)
 void btnOnSpeedSample(float s) {
+#if BTN_BOOST_ENABLE
   static float last = -1.0f; static uint8_t stable = 0;
   uint32_t now = millis();
+  bool statusMode = btnStatusMs && (uint32_t)(now - btnStatusMs) < 60000;
+  if (statusMode || btnG > 0) { last = s; stable = 0; return; }                    // الطريقة الأدق متاحة، أو هذه سرعة أمرنا
   if (last >= 0) {
-    float dl = s - last;
-    if (fabsf(dl) < 0.03f) { if (stable < 250) stable++; }
+    float dl = s - last, ad = fabsf(dl);
+    if (ad < 0.03f) { if (stable < 250) stable++; }
     else {
-      bool ownRecent = false;
-      for (uint8_t i = 0; i < 6; i++) if (ownMs[i] && (uint32_t)(now - ownMs[i]) < 8000) ownRecent = true;
-      bool boostRecent = btnBoostMs && (uint32_t)(now - btnBoostMs) < 8000;
-      if (stable >= 2 && !ownRecent && !boostRecent) btnFire(last, dl, now);
+      bool ownRecent = ownLastMs && (uint32_t)(now - ownLastMs) < 8000;
+      if (stable >= 2 && !ownRecent && ad >= BTN_STEP_MIN && ad <= BTN_STEP_MAX)
+        btnPress(dl > 0 ? 1.0f : -1.0f, (int)lroundf(ad / 0.1f), last, now);
       stable = 0;
     }
   }
   last = s;
-}
 #else
-void btnOnSpeedSample(float) {}
-#endif
-static void btnOnTargetSpeed(float v) {
-  uint32_t now = millis();
-  bool echo = isOwnEcho(v, now);
-  float prev = btnLastV;
-  btnLastV = v;
-  if (echo) {
-    if (btnBoostTarget > 0 && fabsf(v - btnBoostTarget) < 0.03f) btnBoostTarget = -1.0f;
-    return;
-  }
-#if BTN_BOOST_ENABLE
-  if (btnBoostTarget > 0 && (uint32_t)(now - btnBoostMs) > 3000) btnBoostTarget = -1.0f;
-  if (prev < 0 && tmSpeedMs && (uint32_t)(now - tmSpeedMs) < 4000) prev = tmSpeed;   // لا مرجع بعد: استخدم السرعة الحالية
-  if (prev < 0) return;
-  btnFire(prev, v - prev, now);
+  (void)s;
 #endif
 }
 
@@ -2832,6 +2864,34 @@ void shaperTick(uint32_t now) {
   }
 }
 
+// تصحيح الهدف المعتمد: بعد توقف الضغطات تتأكد من أن المشاية استقرت عليه (وإلا أعاد الإرسال حتى 3 مرات)
+void btnTick(uint32_t now) {
+#if BTN_BOOST_ENABLE
+  float g = btnG;
+  if (g < 0) return;
+  uint32_t q = (uint32_t)(now - btnEventMs);
+  if (q < 700) return;                                                              // ما زال المستخدم يضغط
+  bool statusMode = btnStatusMs && (uint32_t)(now - btnStatusMs) < 60000;
+  bool done = false;
+  if (statusMode) {
+    if (fabsf(btnLastV - g) < 0.03f) done = (q > 2000);                             // تأكّدت المشاية من الهدف
+    else if (btnRetry < 3 && (uint32_t)(now - btnSentMs) > 700) {                   // لم تستقر: أعد الإرسال
+      btnRetry++; btnSentMs = now;
+      Fwd f; f.n = 3; f.ms = now;
+      uint16_t rv = (uint16_t)lroundf(g * 100.0f);
+      f.d[0] = 0x02; f.d[1] = (uint8_t)(rv & 255); f.d[2] = (uint8_t)(rv >> 8);
+      handleFwd(f);
+      Serial.printf("[BTN] re-assert %.1f km/h (try %u)\n", g, (unsigned)btnRetry);
+    } else if (btnRetry >= 3 && q > 4000) done = true;
+  } else {
+    done = (q > 5000);
+  }
+  if (done) { btnLastV = g; btnG = -1.0f; }
+#else
+  (void)now;
+#endif
+}
+
 // قرار الحماية: تخفيض السرعة 1 كم/س كل 1.5 ثانية حتى 3 كم/س ثم إيقاف، وإيقاف فوري عند الخطر الشديد
 size_t lockDecide(LockState& s, uint32_t now, bool fresh, float cur, bool hard, uint8_t out[3]) {
   uint32_t gap = s.stopped ? 3000 : 1500;
@@ -2924,6 +2984,7 @@ void guardTask(void*) {
         ls = {0, false, 0};
         flushFwd();
         shaperTick(millis());
+        btnTick(millis());
       }
     } else if (!want && conn) {
       tmClient->disconnect();
