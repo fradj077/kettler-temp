@@ -1653,7 +1653,7 @@ struct SafetyConfig {
   uint8_t safeTest;  // وضع الاختبار الآمن: 1 = تنبيهات فقط بدون إيقاف، 0 = إيقاف حقيقي (افتراضي: 0)
 };
 
-SafetyConfig safetyCfg = {1, 750, 3.0f, 1, 400, 2.0f, 1, 2.0f, 40, 0};
+SafetyConfig safetyCfg = {1, 1500, 3.0f, 1, 250, 1.2f, 1, 2.0f, 35, 0};
 Preferences safetyPrefs;
 
 extern NimBLERemoteCharacteristic* tmCp;
@@ -1662,21 +1662,25 @@ void sendLong(const char* s);
 
 void loadSafetyConfig() {
   safetyPrefs.begin("k_safety", false);
-  if (safetyPrefs.getBytesLength("cfg_v4") == sizeof(safetyCfg)) {
-    safetyPrefs.getBytes("cfg_v4", &safetyCfg, sizeof(safetyCfg));
+  if (safetyPrefs.getBytesLength("cfg_v5") == sizeof(safetyCfg)) {
+    safetyPrefs.getBytes("cfg_v5", &safetyCfg, sizeof(safetyCfg));
   } else {
-    safetyPrefs.putBytes("cfg_v4", &safetyCfg, sizeof(safetyCfg));
+    safetyPrefs.putBytes("cfg_v5", &safetyCfg, sizeof(safetyCfg));
   }
-  safetyCfg.safeTest = 0;
-  // احترام القيم التي يحفظها المستخدم في الفلاش بالكامل (من 0.6A فصاعداً) دون إجبارها على 1.8A!
-  if (safetyCfg.fsMs < 250) safetyCfg.fsMs = 600;
-  if (safetyCfg.drMs < 100) safetyCfg.drMs = 250;
-  if (safetyCfg.drAmp < 0.6f) safetyCfg.drAmp = 1.2f;
-  if (safetyCfg.rcVar < 15) safetyCfg.rcVar = 35;
+  safetyCfg.fsEn = safetyCfg.fsEn ? 1 : 0;
+  safetyCfg.drEn = safetyCfg.drEn ? 1 : 0;
+  safetyCfg.rcEn = safetyCfg.rcEn ? 1 : 0;
+  safetyCfg.safeTest = safetyCfg.safeTest ? 1 : 0;
+  if (safetyCfg.fsMs < 500 || safetyCfg.fsMs > 10000) safetyCfg.fsMs = 1500;
+  if (safetyCfg.fsVmin < 1.5f || safetyCfg.fsVmin > 8.0f) safetyCfg.fsVmin = 3.0f;
+  if (safetyCfg.drMs < 100 || safetyCfg.drMs > 1000) safetyCfg.drMs = 250;
+  if (safetyCfg.drAmp < 0.5f || safetyCfg.drAmp > 4.0f) safetyCfg.drAmp = 1.2f;
+  if (safetyCfg.rcDrop < 0.5f || safetyCfg.rcDrop > 6.0f) safetyCfg.rcDrop = 2.0f;
+  if (safetyCfg.rcVar < 15 || safetyCfg.rcVar > 60) safetyCfg.rcVar = 35;
 }
 
 void saveSafetyConfig() {
-  safetyPrefs.putBytes("cfg_v4", &safetyCfg, sizeof(safetyCfg));
+  safetyPrefs.putBytes("cfg_v5", &safetyCfg, sizeof(safetyCfg));
 }
 
 void sendSafetyConfig() {
@@ -1732,12 +1736,11 @@ void onSafetyTrigger(uint8_t type, uint32_t valMs, float speed) {
     char b[96];
     snprintf(b, sizeof(b), "SF:EVT=DRAG,%lu,ACT\n", (unsigned long)valMs);
     sendLine(b);
-  } else if (type == 3) { // 3. نظام الإنقاذ وخفض السرعة التلقائي عند التعثر المستمر
+  } else if (type == 3) { // 3. نظام الإنقاذ وخفض السرعة التلقائي لمرة واحدة فقط دون قفل السرعة!
     float newSpeed = speed - safetyCfg.rcDrop;
-    if (newSpeed < 1.5f) newSpeed = 1.5f;
-    reqSpeed = newSpeed;
-    outSpeed = newSpeed;
-    lastSentSpd = newSpeed;
+    if (newSpeed < 2.0f) newSpeed = 2.0f;
+    // تصفير shaperReset حتى لا يقوم shaperTick بإرجاع السرعة إلى 3 كم/س عندما يرفع المستخدم السرعة مجدداً!
+    shaperReset();
     uint16_t v = (uint16_t)lroundf(newSpeed * 100.0f);
     uint8_t speedCmd[3] = {0x02, (uint8_t)(v & 255), (uint8_t)(v >> 8)};
     if (tmCp) {
@@ -1907,14 +1910,14 @@ void checkSafetyTriggers(uint32_t nowMs, float speedKmh) {
     dynamicEmptyCeilingA = 1.40f + (speedKmh * 0.08f) + 0.45f;
   }
 
-  // --- آلية 1: كاشف النزول السريع (Dismount) ---
-  if (safetyCfg.fsEn && speedKmh >= safetyCfg.fsVmin) {
-    if (m.currentA <= dynamicEmptyCeilingA && !newStep && (nowMs - lastStepSeenMs) > 900) {
+  // --- آلية 1: كاشف النزول السريع (Dismount) بالثواني المحددة من المستخدم ---
+  if (safetyCfg.fsEn && speedKmh >= safetyCfg.fsVmin && runnerLoadedOnBelt) {
+    if (m.currentA <= dynamicEmptyCeilingA && !newStep) {
       if (emptyBeltStartMs == 0) {
         emptyBeltStartMs = nowMs;
       } else {
         uint32_t emptyDur = nowMs - emptyBeltStartMs;
-        uint32_t reqEmptyMs = (safetyCfg.fsMs < 650) ? 650 : safetyCfg.fsMs;
+        uint32_t reqEmptyMs = (safetyCfg.fsMs < 500) ? 500 : safetyCfg.fsMs;
         if (emptyDur >= reqEmptyMs) {
           resetRunnerMountState();
           lastSafetyActionMs = nowMs;
@@ -1928,18 +1931,31 @@ void checkSafetyTriggers(uint32_t nowMs, float speedKmh) {
   }
 
   // --- آلية 3: نظام الإنقاذ الذكي عند انكسار الإيقاع الفعلي (Rhythm-Break Auto-Rescue) ---
-  if (safetyCfg.rcEn && speedKmh >= 3.0f && newStep && rhythmEstablished && stepIntervalIdx >= 3) {
+  // لا يتدخل أبداً أثناء تغيير السرعة اليدوي أو تحت سرعة 4.0 كم/س، ولا يقفل السرعة بعد التدخل!
+  static float lastRhythmSpd = 0.0f;
+  static uint32_t lastSpdChangeMs = 0;
+  static uint32_t lastRescueMs = 0;
+  if (fabsf(speedKmh - lastRhythmSpd) >= 0.25f) {
+    lastRhythmSpd = speedKmh;
+    lastSpdChangeMs = nowMs;
+    stepIntervalIdx = 0;
+    rhythmEstablished = false;
+    jitterStreak = 0;
+  }
+  bool speedStableForRhythm = ((nowMs - lastSpdChangeMs) >= 4500) && ((nowMs - lastRescueMs) >= 20000);
+  if (safetyCfg.rcEn && speedKmh >= 4.0f && speedStableForRhythm && runnerLoadedOnBelt && newStep && rhythmEstablished && stepIntervalIdx >= 6) {
     uint32_t dt1 = stepIntervals[(stepIntervalIdx - 1) & 3];
     uint32_t dt2 = stepIntervals[(stepIntervalIdx - 2) & 3];
     if (dt1 > 0 && dt2 > 0) {
       float diff = fabsf((float)dt1 - (float)dt2);
       float avg = (float)(dt1 + dt2) * 0.5f;
       float jitterPct = (diff / avg) * 100.0f;
-      float reqVar = (safetyCfg.rcVar < 35) ? 35.0f : (float)safetyCfg.rcVar;
-      if (jitterPct >= reqVar) {
+      float reqVar = (safetyCfg.rcVar < 20) ? 20.0f : (float)safetyCfg.rcVar;
+      if (jitterPct >= reqVar && m.currentP2pA >= 0.45f) {
         jitterStreak++;
-        if (jitterStreak >= 2) {
+        if (jitterStreak >= 3) {
           lastSafetyActionMs = nowMs;
+          lastRescueMs = nowMs;
           jitterStreak = 0;
           stepIntervalIdx = 0;
           rhythmEstablished = false;
@@ -2097,14 +2113,14 @@ void handleLine(const char* l) {
     if (sscanf(l + 4, "%d,%d,%f,%d,%d,%f,%d,%f,%d,%d",
                &fe, &fm, &fv, &de, &dm, &da, &re, &rd, &rv, &st) >= 10) {
       safetyCfg.fsEn = constrain(fe, 0, 1);
-      safetyCfg.fsMs = constrain(fm, 250, 1500);
+      safetyCfg.fsMs = constrain(fm, 500, 10000);
       safetyCfg.fsVmin = constrain(fv, 1.5f, 8.0f);
       safetyCfg.drEn = constrain(de, 0, 1);
-      safetyCfg.drMs = constrain(dm, 80, 800);
-      safetyCfg.drAmp = constrain(da, 0.4f, 4.0f);
+      safetyCfg.drMs = constrain(dm, 100, 1000);
+      safetyCfg.drAmp = constrain(da, 0.5f, 4.0f);
       safetyCfg.rcEn = constrain(re, 0, 1);
       safetyCfg.rcDrop = constrain(rd, 0.5f, 6.0f);
-      safetyCfg.rcVar = constrain(rv, 10, 60);
+      safetyCfg.rcVar = constrain(rv, 15, 60);
       safetyCfg.safeTest = constrain(st, 0, 1);
       saveSafetyConfig();
       sendLine("SF:OK\n");
@@ -2718,13 +2734,18 @@ void shaperTick(uint32_t now) {
   float cap = capSpeedFor(lastTemp, effWarn(), hotC, effMaxSpeed(), cfg.capMin, cfg.capOn != 0);
   float target = reqSpeed < cap ? reqSpeed : cap;
   outSpeed = shapeStep(outSpeed, target, cfg.accel, cfg.decel, dt);
-  bool beltMismatch = speedFresh() && (tmSpeed > 0.4f) && (fabsf(tmSpeed - outSpeed) >= 0.35f) && ((uint32_t)(now - lastForceSendMs) >= 1500);
-  if (lastSentSpd < 0 || fabsf(outSpeed - lastSentSpd) >= 0.05f || beltMismatch) {
+  if (lastSentSpd < 0 || fabsf(outSpeed - lastSentSpd) >= 0.05f) {
     uint16_t v = (uint16_t)lroundf(outSpeed * 100.0f);
     uint8_t b[3] = {0x02, (uint8_t)(v & 255), (uint8_t)(v >> 8)};
     sendRaw(b, 3);
     lastSentSpd = outSpeed;
     lastForceSendMs = now;
+    // إذا وصلت السرعة للهدف، نصفر reqSpeed إذا لم يكن هناك تحديد حرارة نشط حتى لا يعاند shaperTick أزرار المشاية!
+    if (fabsf(outSpeed - target) < 0.05f && !cdActive && (!cfg.capOn || lastTemp < effWarn())) {
+      reqSpeed = -1.0f;
+      outSpeed = -1.0f;
+      lastSentSpd = -1.0f;
+    }
   }
 }
 
