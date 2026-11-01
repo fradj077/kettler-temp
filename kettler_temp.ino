@@ -1794,7 +1794,7 @@ void checkSafetyTriggers(uint32_t nowMs, float speedKmh) {
     resetRunnerMountState();
     return;
   }
-  if ((nowMs - lastSafetyActionMs) < 5000) return;
+  if ((nowMs - lastSafetyActionMs) < 1000) return;
 
   auto m = dspEngine.getMetrics();
   uint32_t curStepCount = m.stepCount;
@@ -1943,7 +1943,7 @@ void checkSafetyTriggers(uint32_t nowMs, float speedKmh) {
     rhythmEstablished = false;
     jitterStreak = 0;
   }
-  bool speedStableForRhythm = ((nowMs - lastSpdChangeMs) >= 4500) && ((nowMs - lastRescueMs) >= 20000);
+  bool speedStableForRhythm = ((nowMs - lastSpdChangeMs) >= 2000);
   if (safetyCfg.rcEn && speedKmh >= 4.0f && speedStableForRhythm && runnerLoadedOnBelt && newStep && rhythmEstablished && stepIntervalIdx >= 6) {
     uint32_t dt1 = stepIntervals[(stepIntervalIdx - 1) & 3];
     uint32_t dt2 = stepIntervals[(stepIntervalIdx - 2) & 3];
