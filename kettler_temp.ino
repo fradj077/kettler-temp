@@ -3069,17 +3069,25 @@ void dspSave() {
 void dspLoad() {
   dsp::DspConfig t = dspEngine.getDefaultConfig();
   size_t storedLen = dspPrefs.getBytesLength("c");
+  // v47.1: الترقيتان التاليتان تُطبَّقان مرة واحدة فقط (علامة kmig في NVS)، وبعدها تُحترم القيم التي يحفظها المستخدم
+  bool kMig = (dspPrefs.getUChar("kmig", 0) == 0);
   if (storedLen > 0) {
     size_t toRead = storedLen < sizeof(t) ? storedLen : sizeof(t);
     dspPrefs.getBytes("c", &t, toRead);
-    if (t.kurtosisThresh < 15.0f) t.kurtosisThresh = 18.0f; // ترقية تلقائية للعتبة لتلائم محرك كتلر
-    // إصلاح: إذا كانت الحساسية المحفوظة عالقة على القيمة القديمة 26.4 بسبب خطأ الترتيب السابق، نرقيها للحساسية الفعلية (~37.3)
-    if (fabsf(t.sensMvPerA - 26.4f) < 0.15f) {
-      float actS = dspEngine.getMetrics().activeSensMvA;
-      t.sensMvPerA = (actS >= 30.0f && actS <= 42.0f) ? actS : 37.3f;
+    bool migChanged = false;
+    if (kMig) {
+      if (t.kurtosisThresh < 15.0f) { t.kurtosisThresh = 18.0f; migChanged = true; } // ترقية تلقائية للعتبة لتلائم محرك كتلر
+      // إصلاح: إذا كانت الحساسية المحفوظة عالقة على القيمة القديمة 26.4 بسبب خطأ الترتيب السابق، نرقيها للحساسية الفعلية (~37.3)
+      if (fabsf(t.sensMvPerA - 26.4f) < 0.15f) {
+        float actS = dspEngine.getMetrics().activeSensMvA;
+        t.sensMvPerA = (actS >= 30.0f && actS <= 42.0f) ? actS : 37.3f;
+        migChanged = true;
+      }
     }
     dspEngine.setConfig(t);
+    if (migChanged) dspPrefs.putBytes("c", &t, sizeof t);
   }
+  if (kMig) dspPrefs.putUChar("kmig", 1);
   float savedKWh = dspPrefs.getFloat("ekwh", 0.0f);
   uint32_t savedSteps = dspPrefs.getUInt("steps", 0);
   dspEngine.loadCumulativeCounters(savedKWh, savedSteps);
@@ -3334,8 +3342,14 @@ void rawDumpPump() {
 void loop() {
   uint32_t now = millis();
 
-  if (pendW > 0) { warnC = pendW; pendW = 0; limPrefs.putFloat("w", warnC); }
-  if (pendH > 0) { hotC = pendH; pendH = 0; limPrefs.putFloat("h", hotC); }
+  bool limSaved = false;
+  if (pendW > 0) { warnC = pendW; pendW = 0; limPrefs.putFloat("w", warnC); limSaved = true; }
+  if (pendH > 0) { hotC = pendH; pendH = 0; limPrefs.putFloat("h", hotC); limSaved = true; }
+  if (limSaved && connected) { // v47.1: تأكيد للتطبيق بعد الكتابة في NVS
+    char lmB[40];
+    snprintf(lmB, sizeof lmB, "LM:%.1f,%.1f\n", warnC, hotC);
+    sendLine(lmB);
+  }
 
   if (!pending && now - tReq >= 2000) { ds.requestTemperatures(); tReq = now; pending = true; }
   if (pending && now - tReq >= 800)   { pending = false; onTemp(now, ds.getTempCByIndex(0)); }
